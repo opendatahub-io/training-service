@@ -1,26 +1,37 @@
 openapi: 3.0.3
 info:
-  title: OpenDataHub Training Service Developer Preview API
+  title: Training API - RHOAI 3.6 Developer Preview
   description: >
-    RHOAI 3.6 GA Developer Preview API for submitting Ray-backed training jobs.
-    Requests are scoped to an OpenShift Project. The service is stateless and
-    relies on the caller's existing OpenShift identity and RBAC permissions.
-    This preview does not expose job lifecycle operations, create or manage Ray
-    custom resources/manifests, or provide an operator.
-  version: 0.1.0
+    Minimal Training API for Ray-backed training jobs in the RHOAI 3.6 GA
+    timeframe. Distributed separately through a Helm chart in the same ODH
+    repository as the Python/FastAPI service; no Training API operator.
+    Submission uses the CodeFlare and Ray SDKs, without constructing or managing
+    RayJob custom resources or Ray job manifests. The service is stateless.
+    Requests authenticate the caller, propagate caller identity, and enforce
+    existing OpenShift permissions and project isolation without privilege
+    elevation. Supports submission, listing, job details, logs, and deletion of
+    terminal Ray job records. Job Lifecycle operations (cancel, pause, and resume)
+    are outside this Developer Preview. Resource estimation is a stretch goal.
+    Job reads and deletion use the Ray SDK against an authorized project-bound
+    endpoint, not RayJob custom resources or a service-owned job database.
+  version: 1.3.0-dp
 servers:
   - url: https://taas.openshift.example.com/api/v1
-    description: Training Service API
+    description: Training API deployment (example URL)
+
 security:
-  - bearerAuth: []
+  - OpenShiftBearer: []
 
 paths:
   /training-jobs/estimate:
     post:
       summary: Estimate training resources (stretch goal)
+      x-dp-scope: stretch
       description: >
-        Optional Developer Preview endpoint for theoretical compute, VRAM, and
-        runtime estimates. It does not submit a job or access a project.
+        Optional stretch goal, not required for Developer Preview acceptance.
+        Calculates theoretical resource and runtime estimates from the supplied
+        inputs. It does not submit a job or access project resources, secrets,
+        private model content, or private dataset content.
       operationId: estimateTrainingJob
       tags:
         - Estimations
@@ -44,23 +55,21 @@ paths:
 
   /algorithms:
     get:
-      summary: List available training algorithms
+      summary: List available Ray training algorithms
       description: >
-        Returns the algorithms exposed by the installed Training Hub content.
-        Discovery is performed through Kubernetes APIs and does not submit or
-        manage a job.
+        Read-only submission helper. Uses Kubernetes APIs directly under the
+        caller's identity to discover the configured algorithm catalog and
+        parameter schemas. Returns only content the caller is authorized to read.
       operationId: listAlgorithms
       tags:
-        - Discovery
+        - Infrastructure & Discovery
       responses:
         '200':
-          description: Catalog of available training algorithms
+          description: Catalog of available training algorithms and hyperparameter schemas
           content:
             application/json:
               schema:
                 type: object
-                required:
-                  - algorithms
                 properties:
                   algorithms:
                     type: array
@@ -73,15 +82,25 @@ paths:
 
   /projects/{project}/training-jobs:
     post:
-      summary: Submit a Ray training job
+      summary: Submit a Ray training job in an OpenShift Project
       description: >
-        Submits a training job for the specified OpenShift Project using the
-        CodeFlare and Ray SDKs. The service must use the caller's identity and
-        existing project permissions. It must not create or manage Ray job
-        custom resources or manifests.
-      operationId: submitTrainingJob
+        Validates the training request and submits it using the CodeFlare and Ray
+        SDKs. The project path defines the target namespace for the submission
+        and all referenced queues, secrets, and PVCs. Caller identity is derived
+        from the authenticated OpenShift token and propagated through the
+        submission path; identity and group claims supplied in request fields
+        or untrusted headers must not be used for authorization.
+        Every downstream operation must enforce the caller's existing OpenShift
+        permissions. Use only a project-bound, authorized Ray endpoint; Ray
+        connectivity or a namespace field alone does not establish authorization.
+        There is no fallback to an elevated service identity.
+        The service does not construct or manage RayJob custom resources or Ray
+        job manifests. A successful response acknowledges SDK submission, not
+        job completion. The returned id can be used with the job detail and log
+        endpoints in the same project.
+      operationId: createTrainingJob
       tags:
-        - Training Submission
+        - Training Jobs
       parameters:
         - $ref: '#/components/parameters/Project'
       requestBody:
@@ -92,7 +111,7 @@ paths:
               $ref: '#/components/schemas/CreateJobRequest'
       responses:
         '202':
-          description: Training submission accepted by the Ray backend
+          description: Training submission accepted by Ray; execution is asynchronous
           content:
             application/json:
               schema:
@@ -104,22 +123,220 @@ paths:
         '403':
           $ref: '#/components/responses/403Forbidden'
         '409':
-          description: A submission with the same name already exists
+          description: Submission identifier already exists in the selected Ray backend
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    get:
+      summary: List training jobs in an OpenShift Project
+      description: >
+        Uses Ray SDK list_jobs against the authorized project-bound Ray endpoint.
+        Returns only training submissions belonging to the target project that
+        the caller is authorized to read. Enforce caller permissions before
+        querying Ray; caller-supplied metadata is not an authorization boundary.
+        The service applies filters and pagination to the authorized results;
+        these are not native Ray SDK list_jobs parameters. Pagination is
+        stateless and does not provide a consistent snapshot of changing jobs.
+      operationId: listTrainingJobs
+      tags:
+        - Training Jobs
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/JobStatus'
+        - name: queue_name
+          in: query
+          required: false
+          description: Filter by queue name recorded in training submission metadata.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 20
+        - name: page_token
+          in: query
+          description: >
+            Opaque continuation token for the same project and filters. The
+            token never grants access; every request rechecks caller permissions.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of authorized training jobs in the specified project
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - items
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TrainingJob'
+                  next_page_token:
+                    type: string
+                    description: Omitted when no further results are available.
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+
+  /projects/{project}/training-jobs/{job_id}:
+    parameters:
+      - $ref: '#/components/parameters/Project'
+      - $ref: '#/components/parameters/JobId'
+
+    get:
+      summary: Get training job status and available details
+      description: >
+        Uses Ray SDK get_job_info after verifying the caller's read access to
+        the project and training submission. Returns current Ray status and
+        available submission metadata without storing service-side job state.
+        Metrics and progress are optional and returned only when exposed by an
+        authorized training telemetry source; the Ray Jobs SDK does not provide
+        training metrics or epoch progress itself. Missing values are omitted,
+        not fabricated or inferred from job status.
+      operationId: getTrainingJob
+      tags:
+        - Training Jobs
+      responses:
+        '200':
+          description: Current job status and available metadata, metrics, and progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrainingJob'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+
+    delete:
+      summary: Delete a terminal Ray training job record
+      description: >
+        Uses Ray SDK delete_job after verifying the caller's delete permission
+        for the target project and submission. Only SUCCEEDED, FAILED, or STOPPED
+        jobs can be deleted. A non-terminal job returns 409; this endpoint does
+        not stop or cancel it. Does not delete Kubernetes resources, checkpoints,
+        model outputs, or Ray log files on disk. Checkpoint purging is unsupported
+        in the Developer Preview; purge_checkpoints=true returns 400.
+      operationId: deleteTrainingJob
+      tags:
+        - Training Jobs
+      parameters:
+        - name: purge_checkpoints
+          in: query
+          description: Only false is supported; checkpoint deletion is outside the DP scope.
+          schema:
+            type: boolean
+            enum: [false]
+            default: false
+      responses:
+        '204':
+          description: Terminal Ray job record deleted successfully
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          description: Job is not terminal and cannot be deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /projects/{project}/training-jobs/{job_id}/logs:
+    get:
+      summary: Read or follow training job driver logs
+      description: >
+        Verifies the caller's project and job log access before using Ray SDK
+        get_job_logs for a text snapshot or tail_job_logs for a stream adapted
+        to Server-Sent Events. Returns only logs for the authorized submission.
+        The DP exposes driver stdout/stderr, not per-worker or per-rank log
+        aggregation. Streaming connections are transient, not durable job state.
+      operationId: streamJobLogs
+      tags:
+        - Observability
+      parameters:
+        - $ref: '#/components/parameters/Project'
+        - $ref: '#/components/parameters/JobId'
+        - name: follow
+          in: query
+          description: False returns text/plain; true follows logs as text/event-stream.
+          schema:
+            type: boolean
+            default: false
+        - name: tail_lines
+          in: query
+          description: >
+            Number of trailing lines in the non-following snapshot, selected by
+            the service after get_job_logs. Ignored when follow=true, which
+            forwards the log chunks provided by Ray's tail_job_logs.
+          schema:
+            type: integer
+            minimum: 1
+            default: 100
+        - name: node_rank
+          in: query
+          description: >
+            Compatibility parameter; only 0 is supported and selects the driver
+            log, not a training worker rank. Other values return 400.
+          schema:
+            type: integer
+            enum: [0]
+            default: 0
+      responses:
+        '200':
+          description: Driver log snapshot or SSE stream, selected by follow
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: "event: log\ndata: {\"message\":\"Epoch 1/5 - loss: 0.241\"}\n\n"
+            text/plain:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
 
   /projects/{project}/queues:
     get:
-      summary: List available Kueue LocalQueues
+      summary: List available Kueue LocalQueues in the OpenShift Project (if Kueue is enabled)
       description: >
-        Returns queues visible in the specified OpenShift Project. Discovery
-        uses Kubernetes APIs directly and does not manage jobs or queues.
+        Read-only submission helper. Queries Kubernetes APIs directly using the
+        caller's identity and permissions in the target project. Does not create,
+        update, or delete queues or expose cluster-wide quota information.
       operationId: listQueues
       tags:
-        - Discovery
+        - Infrastructure & Discovery
       parameters:
         - $ref: '#/components/parameters/Project'
       responses:
         '200':
-          description: Queues accessible in the specified OpenShift Project
+          description: List of LocalQueues accessible in the specified OpenShift Project
           content:
             application/json:
               schema:
@@ -131,22 +348,38 @@ paths:
 
 components:
   securitySchemes:
-    bearerAuth:
+    OpenShiftBearer:
       type: http
       scheme: bearer
-      bearerFormat: JWT
-      description: OpenShift OAuth bearer token for the calling user.
+      description: >
+        OpenShift bearer token for the caller. The token may be opaque; JWT is
+        not assumed. Missing or invalid credentials return 401. Authenticated
+        callers without the required project/resource permissions receive 403.
+        Validating a token alone does not authorize any job operation. Caller identity
+        must be propagated to supported downstream authentication boundaries,
+        and caller credentials must not be logged or stored as durable state.
 
   parameters:
     Project:
       name: project
       in: path
       required: true
-      description: Target OpenShift Project name.
+      description: Explicit target OpenShift Project; all resource references are scoped to it.
       schema:
         type: string
-        pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
       example: team-alpha-ml
+
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      description: >
+        Ray submission identifier returned by this API, scoped to the target
+        project. It is not a RayJob custom resource name. Resolve it only through
+        a project-bound Ray endpoint authorized for the caller.
+      schema:
+        type: string
+      example: job-9a8f2b1c
 
   responses:
     '400BadRequest':
@@ -156,21 +389,47 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
     '401Unauthorized':
-      description: Missing or invalid OpenShift bearer token
+      description: Missing, invalid, or expired OpenShift bearer token
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          example: Bearer
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
     '403Forbidden':
-      description: Caller lacks permission for the requested project or resource
+      description: User lacks OpenShift RBAC permissions for the requested resource or project
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    '404NotFound':
+      description: Training submission not found in the authorized target project
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
 
   schemas:
+    JobBackend:
+      type: string
+      enum: [ray]
+      default: ray
+      description: Ray is the only Developer Preview backend. Automatic selection is unsupported.
+
+    JobStatus:
+      type: string
+      enum: [PENDING, RUNNING, SUCCEEDED, FAILED, STOPPED]
+      description: >
+        Native Ray Jobs status returned by reads. STOPPED can be observed if a
+        job is stopped outside this API; it does not imply a DP cancel endpoint.
+        The API does not synthesize paused or provisioning states.
+
     CreateJobRequest:
       type: object
+      additionalProperties: false
       required:
         - name
         - model
@@ -185,8 +444,14 @@ components:
         queue_name:
           type: string
           nullable: true
-          description: Optional Kueue LocalQueue in the target project.
+          description: >
+            Optional Kueue LocalQueue in the target project, passed through the
+            supported CodeFlare SDK submission configuration. Subject to caller
+            permissions and the platform's configured admission policy. This
+            field does not grant queue access or bypass admission.
           example: team-alpha-local-queue
+        backend:
+          $ref: '#/components/schemas/JobBackend'
         model:
           $ref: '#/components/schemas/ModelSpec'
         dataset:
@@ -229,11 +494,15 @@ components:
           example: meta-llama/Llama-3.2-3B
         secret_ref:
           type: string
-          description: Secret reference in the target project containing access tokens.
+          description: >
+            Existing Secret in the target project, accessible under the caller's
+            permissions. Supply its name, not credential contents. The API must
+            not retrieve it using an elevated identity.
           example: hf-secret-token
 
     DatasetSpec:
       type: object
+      description: Dataset references, including PVCs and secrets, are scoped to the target project.
       required:
         - source
         - uri
@@ -250,6 +519,7 @@ components:
           default: train
         secret_ref:
           type: string
+          description: Existing Secret name in the target project; caller permissions apply.
 
     AlgorithmSpec:
       type: object
@@ -259,13 +529,16 @@ components:
         name:
           type: string
           description: >
-            Built-in algorithm identifier exposed by GET /algorithms, such as
-            lora_sft, qlora_sft, sft, or dpo.
+            Builtin algorithm identifier from the Training Hub set shipped in the target release
+            (for example lora_sft, qlora_sft, sft, dpo). Use GET /algorithms for the catalog and
+            parameter schemas.
           example: lora_sft
         parameters:
           type: object
           additionalProperties: true
-          description: Hyperparameter overrides for the selected algorithm.
+          description: >
+            Optional hyperparameter overrides. Opaque values validated against the selected
+            algorithm's Training Hub parameter schema.
           example:
             learning_rate: 0.0002
             num_train_epochs: 3
@@ -275,16 +548,14 @@ components:
 
     ResourceSpec:
       type: object
-      description: Requested compute resources for the submitted job.
+      description: Requested compute resources per job. If omitted, sensible defaults are applied.
       properties:
         num_nodes:
           type: integer
-          minimum: 1
           default: 1
           example: 2
         gpus_per_node:
           type: integer
-          minimum: 0
           default: 1
           example: 4
         gpu_type:
@@ -301,25 +572,33 @@ components:
 
     OutputSpec:
       type: object
+      description: Output credentials must reference an authorized Secret in the target project.
       properties:
         destination_uri:
           type: string
           example: s3://my-ml-bucket/checkpoints/llama3-lora/
         secret_ref:
           type: string
+          description: Existing Secret name in the target project; caller permissions apply.
 
     TrainingJobSubmission:
       type: object
+      description: >
+        Submission receipt returned after Ray accepts the job. The id is the
+        Ray submission identifier, not a Kubernetes custom resource name.
+        No durable service-side job record is created. Subsequent list, detail,
+        log, and delete requests resolve the submission from Ray under the
+        caller's existing permissions.
       required:
-        - submission_id
+        - id
         - name
         - project
         - selected_backend
         - status
       properties:
-        submission_id:
+        id:
           type: string
-          description: Ray submission identifier returned by the submission backend.
+          description: Submission identifier returned by the Ray SDK.
           example: job-9a8f2b1c
         name:
           type: string
@@ -331,17 +610,97 @@ components:
           type: string
           nullable: true
           example: team-alpha-local-queue
+        status:
+          type: string
+          enum: [SUBMITTED]
+          description: Submission acknowledgement only; not a lifecycle status.
+        selected_backend:
+          type: string
+          enum: [ray]
+
+    TrainingJob:
+      type: object
+      description: >
+        Current job view assembled from Ray and available training submission
+        metadata. Optional fields are omitted when unavailable. Metrics and
+        progress are not guaranteed by the Ray Jobs SDK, and no additional
+        telemetry storage or collection service is required for the DP.
+      required:
+        - id
+        - project
+        - status
+        - selected_backend
+      properties:
+        id:
+          type: string
+          description: Stable Ray submission identifier, matching the submission receipt.
+          example: job-9a8f2b1c
+        name:
+          type: string
+          example: llama3-8b-alpaca-lora
+        project:
+          type: string
+          example: team-alpha-ml
+        queue_name:
+          type: string
+          nullable: true
+          example: team-alpha-local-queue
+        status:
+          $ref: '#/components/schemas/JobStatus'
         selected_backend:
           type: string
           enum: [ray]
           example: ray
-        status:
-          type: string
-          enum: [SUBMITTED]
-          example: SUBMITTED
-        submitted_at:
+        progress:
+          type: object
+          description: Optional training progress, only when reported by an authorized source.
+          properties:
+            percentage:
+              type: number
+              format: float
+              example: 45.5
+            current_epoch:
+              type: integer
+              example: 2
+            total_epochs:
+              type: integer
+              example: 5
+            current_step:
+              type: integer
+              example: 910
+            total_steps:
+              type: integer
+              example: 2000
+            eta_seconds:
+              type: integer
+              example: 1240
+        metrics:
+          type: object
+          description: Optional training metrics, only when reported by an authorized source.
+          additionalProperties:
+            type: number
+          example:
+            loss: 0.184
+            eval_loss: 0.212
+            learning_rate: 0.00015
+            throughput_tokens_per_sec: 1420.5
+        resources:
+          $ref: '#/components/schemas/ResourceSpec'
+        created_at:
           type: string
           format: date-time
+          description: Submission timestamp, when available in submission metadata.
+        started_at:
+          type: string
+          format: date-time
+          description: Ray start timestamp converted from Unix milliseconds to RFC 3339.
+        finished_at:
+          type: string
+          format: date-time
+          description: Ray end timestamp converted to RFC 3339; omitted until available.
+        failure_reason:
+          type: string
+          description: Ray failure message when status is FAILED, if available.
 
     JobEstimationResponse:
       type: object
@@ -363,13 +722,10 @@ components:
           items:
             type: string
           example:
-            - Full fine-tuning on 1 GPU may cause OOM.
+            - "Full fine-tuning on 1 GPU will cause OOM. Recommended LoRA or minimum 4x GPUs."
 
     QueueInfoResponse:
       type: object
-      required:
-        - kueue_enabled
-        - queues
       properties:
         kueue_enabled:
           type: boolean
@@ -381,8 +737,6 @@ components:
 
     QueueInfo:
       type: object
-      required:
-        - name
       properties:
         name:
           type: string
@@ -390,21 +744,9 @@ components:
         cluster_queue:
           type: string
           example: gpu-cluster-queue
-        pending_jobs:
-          type: integer
-          example: 1
-        quota_status:
-          type: object
-          additionalProperties: true
-          example:
-            nvidia.com/gpu:
-              used: 8
-              max: 16
 
     AlgorithmDescriptor:
       type: object
-      required:
-        - name
       properties:
         name:
           type: string
@@ -417,20 +759,16 @@ components:
           items:
             type: string
             enum: [ray]
-          example: [ray]
+          example: ["ray"]
         parameter_schema:
           type: object
-          additionalProperties: true
 
     ErrorResponse:
       type: object
-      required:
-        - code
-        - message
       properties:
         code:
           type: integer
           example: 403
         message:
           type: string
-          example: Caller lacks permission in OpenShift Project team-alpha-ml.
+          example: "Caller is not authorized to perform this operation in OpenShift Project 'team-alpha-ml'."

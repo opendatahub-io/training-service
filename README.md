@@ -1,7 +1,7 @@
 # OpenDataHub Training Service
 
-OpenDataHub Training Service exposes a minimal API for submitting Ray-backed
-training jobs in an OpenShift AI environment.
+OpenDataHub Training Service exposes a single API for submitting and managing
+distributed training jobs in an OpenShift AI environment.
 
 The service is Python-based and uses FastAPI. The public contract is maintained
 in api/openapi.yaml; the server implementation is generated with OpenAPI
@@ -10,20 +10,20 @@ application and backend adapters.
 
 ## Current repository state
 
-The RHOAI 3.6 GA Developer Preview is intended for Verizon evaluation. It
-provides one repository with the API and installable Helm chart. It is not an
-operator and does not provide job lifecycle operations.
+This initial commit provides the runnable service shell, health probes, API
+contract, generation command, unit-test setup, and installable Helm chart.
+Training-job behavior will be added behind the generated routes.
 
 The planned backend boundary is:
 
-- CodeFlare and the Ray SDKs for submitting training jobs.
+- Kubernetes/CodeFlare for project scope, permissions, Ray/Trainer resources,
+  and Kueue placement.
 - Kubernetes APIs directly for algorithm discovery and Kueue queue discovery.
-- OpenShift authentication and RBAC for caller identity, project isolation, and
-  permission enforcement.
-- A stateless service with no service-side job database.
+- Ray Jobs submission, through its Python client or equivalent REST adapter, for
+  submitting work to an existing Ray cluster once that integration is finalized.
 
-The estimate endpoint is a stretch goal. See docs/architecture.md for the
-scope and ownership rules, and docs/installation.md for Helm installation.
+See docs/architecture.md for the structure and ownership rules, and
+docs/installation.md for Helm installation.
 
 ## Local development
 
