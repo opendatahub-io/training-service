@@ -25,6 +25,11 @@ The planned backend boundary is:
 See docs/architecture.md for the structure and ownership rules, and
 docs/installation.md for Helm installation.
 
+See [Developer Preview architecture](docs/developer-preview.md) for the proposed
+Ray-only DP scope, Helm deployment diagram, compatibility prerequisites, and
+security model. This proposal does not imply that training behavior is already
+implemented by the service scaffold.
+
 ## Local development
 
 Requirements: Python 3.11+ and uv.
