@@ -1,6 +1,7 @@
 # Installation
 
-The service is distributed as a Helm chart.
+The Developer Preview is distributed as a Helm chart. It is not installed
+through an operator.
 
 ## Install from a checkout
 
@@ -20,7 +21,7 @@ Check the deployment:
     kubectl -n training-service rollout status deployment/training-service
     kubectl -n training-service get service training-service
 
-The chart exposes /healthz and /readyz on port 8080. Kubernetes access
-permissions and backend configuration will be added together with the
-corresponding API implementation; the initial chart intentionally does not
-grant broad cluster permissions.
+The chart exposes /healthz and /readyz on port 8080. The service must receive
+an OpenShift bearer token with the request and use the caller's existing
+identity and project permissions. The chart must not grant broad cluster
+permissions or elevate caller access.
