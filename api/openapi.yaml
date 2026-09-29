@@ -5,16 +5,17 @@ info:
     Minimal Training API for Ray-backed training jobs in the RHOAI 3.6 GA
     timeframe. Distributed separately through a Helm chart in the same ODH
     repository as the Python/FastAPI service; no Training API operator.
-    Submission uses the CodeFlare and Ray SDKs, without constructing or managing
-    RayJob custom resources or Ray job manifests. The service is stateless.
+    Submission uses CodeFlare's managed RayJob SDK path; the SDK creates the
+    RayJob custom resource, and the service does not hand-author RayJob manifests.
+    The service is stateless and keeps no durable job database.
     Requests authenticate the caller, propagate caller identity, and enforce
     existing OpenShift permissions and project isolation without privilege
     elevation. Supports submission, listing, job details, logs, and deletion of
-    terminal Ray job records. Job Lifecycle operations (cancel, pause, and resume)
-    are outside this Developer Preview. Resource estimation is a stretch goal.
-    Job reads and deletion use the Ray SDK against an authorized project-bound
-    endpoint, not RayJob custom resources or a service-owned job database.
-  version: 1.3.0-dp
+    terminal RayJob resources. Cancel, pause, and resume are outside this
+    Developer Preview. Resource estimation is a stretch goal. Job discovery,
+    details, and terminal deletion use caller-authorized Kubernetes APIs for
+    RayJob resources; driver logs use the Ray Jobs SDK.
+  version: 1.4.0-dp
 servers:
   - url: https://taas.openshift.example.com/api/v1
     description: Training API deployment (example URL)
@@ -29,9 +30,14 @@ paths:
       x-dp-scope: stretch
       description: >
         Optional stretch goal, not required for Developer Preview acceptance.
-        Calculates theoretical resource and runtime estimates from the supplied
-        inputs. It does not submit a job or access project resources, secrets,
-        private model content, or private dataset content.
+        Returns GPU-memory bounds and, where supported, a timing range. Timing
+        estimation is experimental and currently supports single-node SFT or
+        OSFT only: it reads a JSONL dataset and runs a real sample training pass,
+        so this synchronous request can take
+        significant time and use compute. Unsupported timing returns the memory
+        estimate with a warning and omits duration. This endpoint does not accept
+        Secret references or submit a RayJob. Models must be loadable without a
+        caller Secret; the estimator may download a public Hugging Face model.
       operationId: estimateTrainingJob
       tags:
         - Estimations
@@ -43,7 +49,7 @@ paths:
               $ref: '#/components/schemas/JobEstimationRequest'
       responses:
         '200':
-          description: Resource and duration estimation result
+          description: Synchronous GPU-memory estimate and, when supported, a timing range
           content:
             application/json:
               schema:
@@ -52,24 +58,31 @@ paths:
           $ref: '#/components/responses/400BadRequest'
         '401':
           $ref: '#/components/responses/401Unauthorized'
+        '415':
+          $ref: '#/components/responses/415UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
 
   /algorithms:
     get:
       summary: List available Ray training algorithms
       description: >
         Read-only submission helper. Uses Kubernetes APIs directly under the
-        caller's identity to discover the configured algorithm catalog and
-        parameter schemas. Returns only content the caller is authorized to read.
+        caller's identity to discover the catalog and parameter schemas exposed
+        by the configured Ray Universal Image for this deployment. The catalog
+        is release- and image-specific; it is not a universal hardcoded list.
       operationId: listAlgorithms
       tags:
         - Infrastructure & Discovery
       responses:
         '200':
-          description: Catalog of available training algorithms and hyperparameter schemas
+          description: Configured-image catalog of available algorithms and hyperparameter schemas
           content:
             application/json:
               schema:
                 type: object
+                required:
+                  - algorithms
                 properties:
                   algorithms:
                     type: array
@@ -84,20 +97,20 @@ paths:
     post:
       summary: Submit a Ray training job in an OpenShift Project
       description: >
-        Validates the training request and submits it using the CodeFlare and Ray
-        SDKs. The project path defines the target namespace for the submission
-        and all referenced queues, secrets, and PVCs. Caller identity is derived
+        Validates the training request and submits it through CodeFlare's
+        managed RayJob SDK path. CodeFlare creates the RayJob resource; the
+        service does not hand-author a RayJob manifest. The project path defines
+        the target namespace for the submission and all referenced queues,
+        secrets, and PVCs. Caller identity is derived
         from the authenticated OpenShift token and propagated through the
         submission path; identity and group claims supplied in request fields
         or untrusted headers must not be used for authorization.
         Every downstream operation must enforce the caller's existing OpenShift
-        permissions. Use only a project-bound, authorized Ray endpoint; Ray
-        connectivity or a namespace field alone does not establish authorization.
-        There is no fallback to an elevated service identity.
-        The service does not construct or manage RayJob custom resources or Ray
-        job manifests. A successful response acknowledges SDK submission, not
-        job completion. The returned id can be used with the job detail and log
-        endpoints in the same project.
+        permissions. A project name or Ray endpoint connectivity alone does not
+        establish authorization. There is no fallback to an elevated service identity.
+        A successful response acknowledges RayJob creation, not that the Ray
+        job has started or completed. The returned id is the RayJob name and can
+        be used with the detail and log endpoints in the same project.
       operationId: createTrainingJob
       tags:
         - Training Jobs
@@ -111,7 +124,13 @@ paths:
               $ref: '#/components/schemas/CreateJobRequest'
       responses:
         '202':
-          description: Training submission accepted by Ray; execution is asynchronous
+          description: RayJob created; training execution proceeds asynchronously
+          headers:
+            Location:
+              description: Relative URL of the created job's detail resource.
+              schema:
+                type: string
+              example: /api/v1/projects/team-alpha-ml/training-jobs/llama3-8b-alpaca-lora
           content:
             application/json:
               schema:
@@ -122,23 +141,32 @@ paths:
           $ref: '#/components/responses/401Unauthorized'
         '403':
           $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
         '409':
-          description: Submission identifier already exists in the selected Ray backend
+          description: A RayJob with the requested name already exists in the project
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: already_exists
+                message: A RayJob with this name already exists in the project.
+        '415':
+          $ref: '#/components/responses/415UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '501':
+          $ref: '#/components/responses/501NotImplemented'
 
     get:
       summary: List training jobs in an OpenShift Project
       description: >
-        Uses Ray SDK list_jobs against the authorized project-bound Ray endpoint.
-        Returns only training submissions belonging to the target project that
-        the caller is authorized to read. Enforce caller permissions before
-        querying Ray; caller-supplied metadata is not an authorization boundary.
-        The service applies filters and pagination to the authorized results;
-        these are not native Ray SDK list_jobs parameters. Pagination is
-        stateless and does not provide a consistent snapshot of changing jobs.
+        Lists RayJob custom resources from the target Kubernetes namespace using
+        the caller's existing permissions. This includes caller-readable RayJobs
+        submitted outside this API. The service does not filter by API ownership.
+        Filters and pagination are applied to the authorized results; every page
+        rechecks caller permissions and pagination is not a durable snapshot.
       operationId: listTrainingJobs
       tags:
         - Training Jobs
@@ -191,6 +219,8 @@ paths:
           $ref: '#/components/responses/401Unauthorized'
         '403':
           $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
 
   /projects/{project}/training-jobs/{job_id}:
     parameters:
@@ -200,19 +230,18 @@ paths:
     get:
       summary: Get training job status and available details
       description: >
-        Uses Ray SDK get_job_info after verifying the caller's read access to
-        the project and training submission. Returns current Ray status and
-        available submission metadata without storing service-side job state.
-        Metrics and progress are optional and returned only when exposed by an
-        authorized training telemetry source; the Ray Jobs SDK does not provide
-        training metrics or epoch progress itself. Missing values are omitted,
-        not fabricated or inferred from job status.
+        Gets the RayJob resource from the target namespace using the caller's
+        existing Kubernetes permissions. The id is the RayJob name. Maps
+        RayJob provisioning/waiting states to PENDING and reports the Ray job's
+        RUNNING, SUCCEEDED, FAILED, or STOPPED state when available. No job state
+        is stored by this service. Metrics and progress are optional and omitted
+        unless exposed by an authorized source; they are not inferred.
       operationId: getTrainingJob
       tags:
         - Training Jobs
       responses:
         '200':
-          description: Current job status and available metadata, metrics, and progress
+          description: Current RayJob status and available metadata, metrics, and progress
           content:
             application/json:
               schema:
@@ -227,26 +256,18 @@ paths:
     delete:
       summary: Delete a terminal Ray training job record
       description: >
-        Uses Ray SDK delete_job after verifying the caller's delete permission
-        for the target project and submission. Only SUCCEEDED, FAILED, or STOPPED
-        jobs can be deleted. A non-terminal job returns 409; this endpoint does
-        not stop or cancel it. Does not delete Kubernetes resources, checkpoints,
-        model outputs, or Ray log files on disk. Checkpoint purging is unsupported
-        in the Developer Preview; purge_checkpoints=true returns 400.
+        Deletes any caller-authorized terminal RayJob in the target namespace,
+        including a RayJob not submitted through this API. Uses the caller's
+        existing Kubernetes permission. KubeRay removes resources owned by the
+        RayJob according to its configured cleanup behavior. A non-terminal job
+        returns 409; this endpoint does not stop or cancel it. It does not delete
+        checkpoints or model outputs.
       operationId: deleteTrainingJob
       tags:
         - Training Jobs
-      parameters:
-        - name: purge_checkpoints
-          in: query
-          description: Only false is supported; checkpoint deletion is outside the DP scope.
-          schema:
-            type: boolean
-            enum: [false]
-            default: false
       responses:
         '204':
-          description: Terminal Ray job record deleted successfully
+          description: Terminal RayJob deleted; KubeRay applies its configured owned-resource cleanup
         '400':
           $ref: '#/components/responses/400BadRequest'
         '401':
@@ -256,21 +277,24 @@ paths:
         '404':
           $ref: '#/components/responses/404NotFound'
         '409':
-          description: Job is not terminal and cannot be deleted
+          description: RayJob is not terminal and cannot be deleted
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: job_not_terminal
+                message: Only terminal RayJobs can be deleted.
 
   /projects/{project}/training-jobs/{job_id}/logs:
     get:
       summary: Read or follow training job driver logs
       description: >
-        Verifies the caller's project and job log access before using Ray SDK
-        get_job_logs for a text snapshot or tail_job_logs for a stream adapted
-        to Server-Sent Events. Returns only logs for the authorized submission.
-        The DP exposes driver stdout/stderr, not per-worker or per-rank log
-        aggregation. Streaming connections are transient, not durable job state.
+        Verifies caller access to the project and RayJob, then uses the Ray Jobs
+        SDK to retrieve driver stdout/stderr as a snapshot or transient
+        Server-Sent Events stream. Worker/rank log aggregation and durable log
+        storage are out of scope. Logs are available only while the managed
+        RayCluster is reachable.
       operationId: streamJobLogs
       tags:
         - Observability
@@ -293,15 +317,6 @@ paths:
             type: integer
             minimum: 1
             default: 100
-        - name: node_rank
-          in: query
-          description: >
-            Compatibility parameter; only 0 is supported and selects the driver
-            log, not a training worker rank. Other values return 400.
-          schema:
-            type: integer
-            enum: [0]
-            default: 0
       responses:
         '200':
           description: Driver log snapshot or SSE stream, selected by follow
@@ -321,14 +336,34 @@ paths:
           $ref: '#/components/responses/403Forbidden'
         '404':
           $ref: '#/components/responses/404NotFound'
+        '409':
+          description: RayJob exists, but driver logs are not ready yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: logs_not_ready
+                message: Driver logs are not available yet; retry later.
+        '410':
+          description: RayJob exists, but its managed RayCluster and logs are gone
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: ray_cluster_gone
+                message: Driver logs are no longer available because the RayCluster was removed.
 
   /projects/{project}/queues:
     get:
       summary: List available Kueue LocalQueues in the OpenShift Project (if Kueue is enabled)
       description: >
         Read-only submission helper. Queries Kubernetes APIs directly using the
-        caller's identity and permissions in the target project. Does not create,
-        update, or delete queues or expose cluster-wide quota information.
+        caller's identity and permissions in the target project. Kueue is
+        optional; if it is not installed or enabled, returns kueue_enabled=false
+        and an empty queues list. Does not create, update, or delete queues or
+        expose cluster-wide quota information.
       operationId: listQueues
       tags:
         - Infrastructure & Discovery
@@ -345,6 +380,8 @@ paths:
           $ref: '#/components/responses/401Unauthorized'
         '403':
           $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
 
 components:
   securitySchemes:
@@ -374,20 +411,22 @@ components:
       in: path
       required: true
       description: >
-        Ray submission identifier returned by this API, scoped to the target
-        project. It is not a RayJob custom resource name. Resolve it only through
-        a project-bound Ray endpoint authorized for the caller.
+        Name of the RayJob custom resource, scoped to the target project. Resolve
+        it only through caller-authorized Kubernetes APIs in that project.
       schema:
         type: string
-      example: job-9a8f2b1c
+      example: llama3-8b-alpaca-lora
 
   responses:
     '400BadRequest':
-      description: Invalid payload or parameter specification
+      description: Malformed JSON or invalid query/path parameter syntax
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: bad_request
+            message: Request JSON or parameters are malformed.
     '401Unauthorized':
       description: Missing, invalid, or expired OpenShift bearer token
       headers:
@@ -399,33 +438,69 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: unauthorized
+            message: A valid OpenShift bearer token is required.
     '403Forbidden':
       description: User lacks OpenShift RBAC permissions for the requested resource or project
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: forbidden
+            message: Caller lacks permission for this operation.
     '404NotFound':
-      description: Training submission not found in the authorized target project
+      description: Target project or RayJob does not exist in the requested scope
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: not_found
+            message: Requested resource was not found.
+    '415UnsupportedMediaType':
+      description: Request body must use application/json
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: unsupported_media_type
+            message: Request body must use application/json.
+    '422UnprocessableEntity':
+      description: JSON is well-formed but fails schema or domain validation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: validation_error
+            message: Request is valid JSON but fails schema or domain validation.
+    '501NotImplemented':
+      description: Requested backend is not implemented in this Developer Preview
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: not_implemented
+            message: The requested backend is not implemented in this Developer Preview.
 
   schemas:
     JobBackend:
       type: string
-      enum: [ray]
+      enum: [ray, kft]
       default: ray
-      description: Ray is the only Developer Preview backend. Automatic selection is unsupported.
+      description: Ray is implemented. KFT is retained for compatibility and returns 501 Not Implemented.
 
     JobStatus:
       type: string
       enum: [PENDING, RUNNING, SUCCEEDED, FAILED, STOPPED]
       description: >
-        Native Ray Jobs status returned by reads. STOPPED can be observed if a
-        job is stopped outside this API; it does not imply a DP cancel endpoint.
-        The API does not synthesize paused or provisioning states.
+        RayJob provisioning and waiting states map to PENDING. Ray job execution
+        maps to RUNNING, SUCCEEDED, FAILED, or STOPPED. STOPPED may be observed
+        if stopped outside this API; it does not imply a DP cancel endpoint.
 
     CreateJobRequest:
       type: object
@@ -438,17 +513,19 @@ components:
       properties:
         name:
           type: string
+          minLength: 1
+          maxLength: 47
+          pattern: '^[a-z]([-a-z0-9]*[a-z0-9])?$'
+          description: DNS-1035-compatible RayJob name; limited to 47 characters by the submission path.
           example: llama3-8b-alpaca-lora
-        description:
-          type: string
         queue_name:
           type: string
           nullable: true
           description: >
-            Optional Kueue LocalQueue in the target project, passed through the
-            supported CodeFlare SDK submission configuration. Subject to caller
-            permissions and the platform's configured admission policy. This
-            field does not grant queue access or bypass admission.
+            Optional Kueue LocalQueue in the target project. When omitted,
+            CodeFlare uses a configured default LocalQueue if one exists;
+            otherwise the job is submitted without a queue. Subject to caller
+            permissions and platform admission policy; this does not grant access.
           example: team-alpha-local-queue
         backend:
           $ref: '#/components/schemas/JobBackend'
@@ -465,22 +542,46 @@ components:
 
     JobEstimationRequest:
       type: object
+      additionalProperties: false
       required:
         - model
         - dataset
         - algorithm
       properties:
         model:
-          $ref: '#/components/schemas/ModelSpec'
+          $ref: '#/components/schemas/EstimationModelSpec'
         dataset:
-          $ref: '#/components/schemas/DatasetSpec'
+          $ref: '#/components/schemas/EstimationDatasetSpec'
         algorithm:
           $ref: '#/components/schemas/AlgorithmSpec'
         resources:
           $ref: '#/components/schemas/ResourceSpec'
 
+    EstimationModelSpec:
+      type: object
+      additionalProperties: false
+      required: [source, uri]
+      properties:
+        source:
+          type: string
+          enum: [huggingface]
+        uri:
+          type: string
+          description: Public Hugging Face model ID or a model available to the profiler without a caller Secret.
+          example: meta-llama/Llama-3.2-3B
+
+    EstimationDatasetSpec:
+      type: object
+      additionalProperties: false
+      required: [uri]
+      properties:
+        uri:
+          type: string
+          description: Path to a JSONL dataset readable by the timing profiler; no Secret-based access is supported.
+
     ModelSpec:
       type: object
+      additionalProperties: false
       required:
         - source
         - uri
@@ -502,6 +603,7 @@ components:
 
     DatasetSpec:
       type: object
+      additionalProperties: false
       description: Dataset references, including PVCs and secrets, are scoped to the target project.
       required:
         - source
@@ -523,15 +625,15 @@ components:
 
     AlgorithmSpec:
       type: object
+      additionalProperties: false
       required:
         - name
       properties:
         name:
           type: string
           description: >
-            Builtin algorithm identifier from the Training Hub set shipped in the target release
-            (for example lora_sft, qlora_sft, sft, dpo). Use GET /algorithms for the catalog and
-            parameter schemas.
+            Algorithm identifier exposed by GET /algorithms for the configured
+            Ray Universal Image and release. Use that catalog and its parameter schema.
           example: lora_sft
         parameters:
           type: object
@@ -540,22 +642,25 @@ components:
             Optional hyperparameter overrides. Opaque values validated against the selected
             algorithm's Training Hub parameter schema.
           example:
-            learning_rate: 0.0002
-            num_train_epochs: 3
-            per_device_train_batch_size: 4
-            lora_r: 16
-            lora_alpha: 32
+            learning_rate: 0.00002
+            num_epochs: 3
 
     ResourceSpec:
       type: object
-      description: Requested compute resources per job. If omitted, sensible defaults are applied.
+      additionalProperties: false
+      description: >
+        The only public source for worker and GPU topology. If omitted, platform
+        defaults are applied. Algorithm parameters describe hyperparameters,
+        not worker topology.
       properties:
         num_nodes:
           type: integer
+          minimum: 1
           default: 1
           example: 2
         gpus_per_node:
           type: integer
+          minimum: 0
           default: 1
           example: 4
         gpu_type:
@@ -572,7 +677,12 @@ components:
 
     OutputSpec:
       type: object
-      description: Output credentials must reference an authorized Secret in the target project.
+      additionalProperties: false
+      required: [destination_uri]
+      description: >
+        If output is omitted from the request, output is ephemeral. If present,
+        destination_uri is required; any credential reference must name an
+        authorized Secret in the target project.
       properties:
         destination_uri:
           type: string
@@ -584,11 +694,10 @@ components:
     TrainingJobSubmission:
       type: object
       description: >
-        Submission receipt returned after Ray accepts the job. The id is the
-        Ray submission identifier, not a Kubernetes custom resource name.
-        No durable service-side job record is created. Subsequent list, detail,
-        log, and delete requests resolve the submission from Ray under the
-        caller's existing permissions.
+        Receipt returned after the CodeFlare SDK creates the RayJob resource.
+        The id is the RayJob custom resource name, not a Ray Jobs submission ID.
+        This acknowledges resource creation only; it does not mean the job has
+        started. Reads use caller-authorized Kubernetes APIs and logs use Ray.
       required:
         - id
         - name
@@ -598,8 +707,8 @@ components:
       properties:
         id:
           type: string
-          description: Submission identifier returned by the Ray SDK.
-          example: job-9a8f2b1c
+          description: Name of the created RayJob custom resource.
+          example: llama3-8b-alpaca-lora
         name:
           type: string
           example: llama3-8b-alpaca-lora
@@ -621,10 +730,10 @@ components:
     TrainingJob:
       type: object
       description: >
-        Current job view assembled from Ray and available training submission
-        metadata. Optional fields are omitted when unavailable. Metrics and
-        progress are not guaranteed by the Ray Jobs SDK, and no additional
-        telemetry storage or collection service is required for the DP.
+        Current view assembled from a caller-authorized RayJob resource and
+        available Ray status. Includes caller-readable RayJobs regardless of
+        whether they were created by this API. Optional fields are omitted when
+        unavailable; the service does not persist job state.
       required:
         - id
         - project
@@ -633,8 +742,8 @@ components:
       properties:
         id:
           type: string
-          description: Stable Ray submission identifier, matching the submission receipt.
-          example: job-9a8f2b1c
+          description: Name of the RayJob custom resource in the project.
+          example: llama3-8b-alpaca-lora
         name:
           type: string
           example: llama3-8b-alpaca-lora
@@ -704,32 +813,55 @@ components:
 
     JobEstimationResponse:
       type: object
+      required: [gpu_memory_bytes_per_device]
       properties:
-        recommended_resources:
-          $ref: '#/components/schemas/ResourceSpec'
+        gpu_memory_bytes_per_device:
+          type: object
+          required: [lower_bound, expected, upper_bound]
+          properties:
+            lower_bound:
+              type: integer
+              format: int64
+              minimum: 0
+            expected:
+              type: integer
+              format: int64
+              minimum: 0
+            upper_bound:
+              type: integer
+              format: int64
+              minimum: 0
+          description: Memory estimate per GPU returned by the Training Hub profiler, in bytes.
         estimated_duration_seconds:
-          type: integer
-          example: 3600
-        estimated_cost_usd:
-          type: number
-          format: float
-          example: 12.50
-        gpu_memory_required_gb_per_device:
-          type: number
-          example: 22.4
+          type: object
+          required: [lower_bound, upper_bound]
+          properties:
+            lower_bound:
+              type: integer
+              format: int64
+              minimum: 0
+            upper_bound:
+              type: integer
+              format: int64
+              minimum: 0
+          description: >
+            Optional timing range in seconds. Omitted when the selected method
+            has no timing estimator; timing is currently experimental and
+            supported only for single-node SFT/OSFT.
         warnings:
           type: array
           items:
             type: string
           example:
-            - "Full fine-tuning on 1 GPU will cause OOM. Recommended LoRA or minimum 4x GPUs."
+            - "Timing estimation is unavailable for this algorithm; memory estimate returned without duration."
 
     QueueInfoResponse:
       type: object
+      required: [kueue_enabled, queues]
       properties:
         kueue_enabled:
           type: boolean
-          example: true
+          description: False when Kueue is absent or disabled in the target deployment.
         queues:
           type: array
           items:
@@ -747,6 +879,7 @@ components:
 
     AlgorithmDescriptor:
       type: object
+      required: [name, supported_backends, parameter_schema]
       properties:
         name:
           type: string
@@ -762,13 +895,32 @@ components:
           example: ["ray"]
         parameter_schema:
           type: object
+          description: JSON Schema for parameters accepted by this algorithm in the configured image.
 
     ErrorResponse:
       type: object
+      additionalProperties: false
+      required: [code, message]
       properties:
         code:
-          type: integer
-          example: 403
+          type: string
+          enum:
+            - bad_request
+            - unauthorized
+            - forbidden
+            - not_found
+            - already_exists
+            - job_not_terminal
+            - logs_not_ready
+            - ray_cluster_gone
+            - unsupported_media_type
+            - validation_error
+            - not_implemented
+          example: forbidden
         message:
           type: string
-          example: "Caller is not authorized to perform this operation in OpenShift Project 'team-alpha-ml'."
+          example: "Caller is not authorized to perform this operation in project team-alpha-ml."
+        details:
+          type: object
+          additionalProperties: true
+          description: Optional structured context, such as invalid fields; never includes credentials.
