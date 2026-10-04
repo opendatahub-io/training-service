@@ -101,10 +101,35 @@ paths:
         managed RayJob SDK path. CodeFlare creates the RayJob resource; the
         service does not hand-author a RayJob manifest. The project path defines
         the target namespace for the submission and all referenced queues,
-        secrets, and PVCs. Caller identity is derived
+        connections, Secrets, and PVCs. Model and dataset URIs use
+        hf://<secret-name>/<hub-repository-id>,
+        s3://<connection-name>/<bucket-name>/<path>, or
+        pvc://<pvc-name>/<path>. Output uses an S3 or PVC destination URI.
+        The URI scheme identifies the source; separate source and secret_ref
+        fields are not accepted. Every Hugging Face input requires a Secret
+        reference, including public repositories. References identify existing
+        resources in this project, never credential values or another namespace.
+        These are Training API locators: the adapter must resolve them into
+        usable storage configuration before CodeFlare/Ray submission, not pass
+        them through as native SDK URIs. S3 connections supply endpoint and
+        authentication configuration; the URI supplies the bucket and path.
+        PVC paths are relative to the volume root and must not escape it.
+        Connections and PVCs are not created automatically. Invalid locators
+        return 422, insufficient caller permissions return 403, and missing
+        referenced project resources return 404. Caller identity is derived
         from the authenticated OpenShift token and propagated through the
         submission path; identity and group claims supplied in request fields
         or untrusted headers must not be used for authorization.
+        Records the authenticated caller's username in the RayJob annotation
+        training.rhoai.io/submitted-by for later detail reads. This attribution
+        is informational and must not be used for authorization.
+        The implementation must also retain the accepted, non-secret POST
+        payload in caller-authorized RayJob metadata for subsequent detail
+        reads, preserving supplied values and leaving omitted optional settings
+        absent. Secret references retain names only, never Secret contents or
+        caller tokens. CodeFlare does not automatically retain this API payload;
+        retaining it requires a caller-authorized metadata integration, not a
+        service database or hand-authored RayJob manifest.
         Every downstream operation must enforce the caller's existing OpenShift
         permissions. A project name or Ray endpoint connectivity alone does not
         establish authorization. There is no fallback to an elevated service identity.
@@ -122,6 +147,82 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/CreateJobRequest'
+            examples:
+              huggingface_inputs_s3_output:
+                summary: HF inputs with a named Secret and S3 output with a named connection
+                value:
+                  name: llama3-8b-alpaca-lora
+                  queue_name: team-alpha-local-queue
+                  backend: ray
+                  model:
+                    uri: hf://hf-secret-token/meta-llama/Llama-3.2-3B
+                  dataset:
+                    uri: hf://hf-secret-token/tatsu-lab/alpaca
+                  algorithm:
+                    name: lora_sft
+                    parameters:
+                      learning_rate: 0.00002
+                      num_epochs: 3
+                      effective_batch_size: 8
+                      max_seq_len: 2048
+                  resources:
+                    num_nodes: 2
+                    gpus_per_node: 4
+                    gpu_type: nvidia.com/gpu
+                    cpus_per_node: "16"
+                    memory_per_node: "64Gi"
+                  output:
+                    destination_uri: s3://checkpoint-storage/my-ml-bucket/checkpoints/llama3-lora/
+              s3_inputs:
+                summary: S3 inputs referencing project-local connections
+                value:
+                  name: s3-training
+                  queue_name: team-alpha-local-queue
+                  backend: ray
+                  model:
+                    uri: s3://model-storage/my-ml-bucket/models/llama3/
+                  dataset:
+                    uri: s3://training-data/my-ml-bucket/datasets/alpaca/train.jsonl
+                  algorithm:
+                    name: lora_sft
+                    parameters:
+                      learning_rate: 0.00002
+                      num_epochs: 3
+                      effective_batch_size: 8
+                      max_seq_len: 2048
+                  resources:
+                    num_nodes: 2
+                    gpus_per_node: 4
+                    gpu_type: nvidia.com/gpu
+                    cpus_per_node: "16"
+                    memory_per_node: "64Gi"
+                  output:
+                    destination_uri: s3://checkpoint-storage/my-ml-bucket/checkpoints/s3-training/
+              pvc_inputs_output:
+                summary: Existing PVCs for input data and saved output
+                value:
+                  name: pvc-training
+                  queue_name: team-alpha-local-queue
+                  backend: ray
+                  model:
+                    uri: pvc://model-storage/models/llama3/
+                  dataset:
+                    uri: pvc://training-data/datasets/alpaca/train.jsonl
+                  algorithm:
+                    name: lora_sft
+                    parameters:
+                      learning_rate: 0.00002
+                      num_epochs: 3
+                      effective_batch_size: 8
+                      max_seq_len: 2048
+                  resources:
+                    num_nodes: 2
+                    gpus_per_node: 4
+                    gpu_type: nvidia.com/gpu
+                    cpus_per_node: "16"
+                    memory_per_node: "64Gi"
+                  output:
+                    destination_uri: pvc://training-output/checkpoints/pvc-training/
       responses:
         '202':
           description: RayJob created; training execution proceeds asynchronously
@@ -165,6 +266,23 @@ paths:
         Lists RayJob custom resources from the target Kubernetes namespace using
         the caller's existing permissions. This includes caller-readable RayJobs
         submitted outside this API. The service does not filter by API ownership.
+        Returns compact summaries containing id, status, and created_at, with
+        queue_name when available. Each created_at is the RayJob resource's
+        Kubernetes metadata.creationTimestamp, including for external jobs;
+        it is not the training start time. Use the job detail endpoint for full
+        details. An accessible project with no matching jobs returns 200 with
+        items: [] and total_count: 0.
+        When status is omitted, no status filter is applied: jobs in every
+        status are eligible, including terminal jobs. All caller-readable jobs
+        in the project are returned across pages, subject to any other supplied
+        filter; this is not an unbounded single response.
+        total_count is the exact number of caller-readable RayJobs matching all
+        supplied filters across all pages, counted before applying the API page
+        limit. With no filters, it counts all caller-readable jobs in the
+        project. The implementation must evaluate the authorized job inventory
+        to compute this count, not use the current page length or Kubernetes
+        remainingItemCount as the total. The count reflects the current request
+        and may change between requests.
         Filters and pagination are applied to the authorized results; every page
         rechecks caller permissions and pagination is not a durable snapshot.
       operationId: listTrainingJobs
@@ -175,6 +293,10 @@ paths:
         - name: status
           in: query
           required: false
+          description: >
+            Optional exact-status filter. When omitted, includes jobs in all
+            statuses, subject to caller access, other filters, and pagination.
+            There is no default status filter or ALL status value.
           schema:
             $ref: '#/components/schemas/JobStatus'
         - name: queue_name
@@ -198,21 +320,69 @@ paths:
             type: string
       responses:
         '200':
-          description: List of authorized training jobs in the specified project
+          description: Compact page of authorized training jobs and total matching count; an empty result has items empty and total_count zero
           content:
             application/json:
               schema:
                 type: object
                 required:
                   - items
+                  - total_count
                 properties:
                   items:
                     type: array
                     items:
-                      $ref: '#/components/schemas/TrainingJob'
+                      $ref: '#/components/schemas/TrainingJobSummary'
+                  total_count:
+                    type: integer
+                    format: int64
+                    minimum: 0
+                    description: >
+                      Exact number of caller-readable jobs matching the supplied
+                      filters across all pages before pagination, not the page
+                      length or the number of remaining jobs. With no filters,
+                      counts all caller-readable jobs in the project. Reflects
+                      the current request and may change between requests.
                   next_page_token:
                     type: string
                     description: Omitted when no further results are available.
+              examples:
+                jobs:
+                  summary: Mixed-status page when status is omitted
+                  value:
+                    total_count: 12
+                    items:
+                      - id: llama3-8b-alpaca-lora
+                        status: RUNNING
+                        queue_name: team-alpha-local-queue
+                        created_at: '2026-10-04T09:00:00Z'
+                      - id: external-ray-job
+                        status: PENDING
+                        created_at: '2026-10-04T09:05:00Z'
+                      - id: completed-ray-job
+                        status: SUCCEEDED
+                        created_at: '2026-10-04T08:30:00Z'
+                      - id: failed-ray-job
+                        status: FAILED
+                        created_at: '2026-10-04T08:00:00Z'
+                      - id: externally-stopped-ray-job
+                        status: STOPPED
+                        created_at: '2026-10-04T07:30:00Z'
+                    next_page_token: opaque-next-page-token
+                filtered_by_status:
+                  summary: Compact list with status=RUNNING
+                  value:
+                    total_count: 1
+                    items:
+                      - id: llama3-8b-alpaca-lora
+                        status: RUNNING
+                        queue_name: team-alpha-local-queue
+                        created_at: '2026-10-04T09:00:00Z'
+                empty_project:
+                  summary: Accessible project with no jobs
+                  value:
+                    total_count: 0
+                    items: []
         '400':
           $ref: '#/components/responses/400BadRequest'
         '401':
@@ -236,16 +406,142 @@ paths:
         RUNNING, SUCCEEDED, FAILED, or STOPPED state when available. No job state
         is stored by this service. Metrics and progress are optional and omitted
         unless exposed by an authorized source; they are not inferred.
+        finished_at reports the Ray execution end time for SUCCEEDED, FAILED,
+        or STOPPED jobs when available. It is omitted for pending or running
+        jobs and when Ray has not reported an end time; no timestamp is invented.
+        For API-created jobs, includes the accepted POST payload in submission,
+        recovered from caller-authorized RayJob metadata rather than a service
+        database. Preserves submitted values and omits optional settings that
+        were not supplied; it does not reconstruct the payload from command-line
+        arguments or raw runtime environments. Top-level resources reports
+        runtime configuration when available; submission.resources retains the
+        submitted settings. External or older jobs without submission metadata
+        omit submission. Named references in storage URIs may be included, but
+        Secret contents, caller tokens, and raw Ray runtime-environment dumps
+        are never returned.
+        Includes submitted_by when the RayJob has the
+        training.rhoai.io/submitted-by annotation recorded at submission. It
+        identifies the original submitter, never the caller making this GET.
+        Jobs without this annotation, including externally submitted jobs,
+        omit submitted_by. Attribution is informational, may be modified by
+        callers with metadata patch permissions, and is never an authorization input.
       operationId: getTrainingJob
       tags:
         - Training Jobs
       responses:
         '200':
-          description: Current RayJob status and available metadata, metrics, and progress
+          description: Accepted submission configuration, current RayJob status, and all available job details
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TrainingJob'
+              examples:
+                api_submitted_job:
+                  summary: Full job details with accepted submission and submitter attribution
+                  value:
+                    id: llama3-8b-alpaca-lora
+                    name: llama3-8b-alpaca-lora
+                    project: team-alpha-ml
+                    status: RUNNING
+                    selected_backend: ray
+                    queue_name: team-alpha-local-queue
+                    submitted_by: alice
+                    submission:
+                      name: llama3-8b-alpaca-lora
+                      queue_name: team-alpha-local-queue
+                      backend: ray
+                      model:
+                        uri: hf://hf-secret-token/meta-llama/Llama-3.2-3B
+                      dataset:
+                        uri: hf://hf-secret-token/tatsu-lab/alpaca
+                      algorithm:
+                        name: lora_sft
+                        parameters:
+                          learning_rate: 0.00002
+                          num_epochs: 3
+                          effective_batch_size: 8
+                          max_seq_len: 2048
+                      resources:
+                        num_nodes: 2
+                        gpus_per_node: 4
+                        gpu_type: nvidia.com/gpu
+                        cpus_per_node: "16"
+                        memory_per_node: "64Gi"
+                      output:
+                        destination_uri: s3://checkpoint-storage/my-ml-bucket/checkpoints/llama3-lora/
+                    progress:
+                      percentage: 45.5
+                      current_epoch: 2
+                      total_epochs: 3
+                      current_step: 910
+                      total_steps: 2000
+                      eta_seconds: 1240
+                    metrics:
+                      loss: 0.184
+                      eval_loss: 0.212
+                      learning_rate: 0.000015
+                      throughput_tokens_per_sec: 1420.5
+                    resources:
+                      num_nodes: 2
+                      gpus_per_node: 4
+                      gpu_type: nvidia.com/gpu
+                      cpus_per_node: "16"
+                      memory_per_node: "64Gi"
+                    created_at: '2026-10-04T09:00:00Z'
+                    started_at: '2026-10-04T09:01:00Z'
+                completed_job:
+                  summary: Succeeded job with creation, start, and finish timestamps
+                  value:
+                    id: completed-ray-job
+                    name: completed-ray-job
+                    project: team-alpha-ml
+                    status: SUCCEEDED
+                    selected_backend: ray
+                    submitted_by: alice
+                    submission:
+                      name: completed-ray-job
+                      model:
+                        uri: hf://hf-secret-token/Qwen/Qwen2.5-0.5B
+                      dataset:
+                        uri: hf://hf-secret-token/tatsu-lab/alpaca
+                      algorithm:
+                        name: lora_sft
+                        parameters:
+                          learning_rate: 0.00002
+                          num_epochs: 3
+                    progress:
+                      percentage: 100
+                      current_epoch: 3
+                      total_epochs: 3
+                      current_step: 2000
+                      total_steps: 2000
+                    created_at: '2026-10-04T08:30:00Z'
+                    started_at: '2026-10-04T08:31:00Z'
+                    finished_at: '2026-10-04T08:50:00Z'
+                minimal_submission:
+                  summary: API-created job with only required POST fields supplied
+                  value:
+                    id: minimal-ray-job
+                    name: minimal-ray-job
+                    project: team-alpha-ml
+                    status: PENDING
+                    selected_backend: ray
+                    submitted_by: bob
+                    submission:
+                      name: minimal-ray-job
+                      model:
+                        uri: hf://hf-secret-token/Qwen/Qwen2.5-0.5B
+                      dataset:
+                        uri: hf://hf-secret-token/tatsu-lab/alpaca
+                      algorithm:
+                        name: lora_sft
+                external_job:
+                  summary: External job without submission metadata or submitter attribution
+                  value:
+                    id: external-ray-job
+                    project: team-alpha-ml
+                    status: PENDING
+                    selected_backend: ray
         '401':
           $ref: '#/components/responses/401Unauthorized'
         '403':
@@ -401,7 +697,13 @@ components:
       name: project
       in: path
       required: true
-      description: Explicit target OpenShift Project; all resource references are scoped to it.
+      description: >
+        Explicit pre-existing OpenShift Project (Kubernetes namespace); all
+        resource references are scoped to it. Provision the project through
+        normal OpenShift self-service or administrator workflows before using
+        this API. The Training API does not create projects or namespaces and
+        never falls back to a default namespace or an elevated service identity.
+        A missing project returns 404; insufficient caller permissions return 403.
       schema:
         type: string
       example: team-alpha-ml
@@ -451,7 +753,7 @@ components:
             code: forbidden
             message: Caller lacks permission for this operation.
     '404NotFound':
-      description: Target project or RayJob does not exist in the requested scope
+      description: Target project, RayJob, or referenced project resource does not exist in the requested scope
       content:
         application/json:
           schema:
@@ -579,49 +881,83 @@ components:
           type: string
           description: Path to a JSONL dataset readable by the timing profiler; no Secret-based access is supported.
 
+    TrainingInputURI:
+      type: string
+      description: >
+        Training API locator for an HF, S3, or PVC model/dataset input. The
+        scheme identifies the source and the authority identifies an existing
+        Secret, connection, or PVC in the target project. Resolve under the
+        caller's existing permissions; do not use an elevated service identity.
+        These locators require adapter resolution, not direct SDK passthrough.
+        Separate source and secret_ref fields, anonymous HF locators, HTTP,
+        and OCI inputs are not supported. Scheme names are case-insensitive.
+      oneOf:
+        - $ref: '#/components/schemas/HuggingFaceURI'
+        - $ref: '#/components/schemas/S3StorageURI'
+        - $ref: '#/components/schemas/PVCStorageURI'
+
+    HuggingFaceURI:
+      type: string
+      format: uri
+      pattern: '^[hH][fF]://[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*/[A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_][A-Za-z0-9_.-]*)?$(?![\s\S])'
+      description: >
+        hf://<secret-name>/<hub-repository-id>. The authority is an existing
+        project-local Hugging Face credential Secret name, never a token.
+        Required for every HF input, including public repositories. The path
+        is the full model or dataset repository ID, including its owner/name
+        when applicable. No anonymous form, query, fragment, or inline credentials.
+      example: hf://hf-secret-token/meta-llama/Llama-3.2-3B
+
+    S3StorageURI:
+      type: string
+      format: uri
+      pattern: '^[sS]3://[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*/[a-z0-9][a-z0-9.-]*/[^/?#\\\s][^?#\\\s]*$(?![\s\S])'
+      description: >
+        s3://<connection-name>/<bucket-name>/<path>. The authority names an
+        existing project-local S3 connection backed by a Secret, not the bucket
+        or an endpoint hostname. The connection supplies endpoint and
+        authentication configuration; use the explicit bucket and non-empty
+        object key or prefix from this URI, not a connection's default bucket.
+        Credential values, userinfo, query strings, and fragments are not accepted.
+      example: s3://training-data/my-ml-bucket/datasets/alpaca/train.jsonl
+
+    PVCStorageURI:
+      type: string
+      format: uri
+      pattern: '^[pP][vV][cC]://[a-z0-9](?:[-a-z0-9]*[a-z0-9])?(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*/(?!%(?:2[fF]|5[cC]))[^/?#\\\s][^?#\\\s]*$(?![\s\S])'
+      not:
+        pattern: '(?:/|%2[fF]|%5[cC])(?:\.|%2[eE]){2}(?:/|%2[fF]|%5[cC]|$)'
+      description: >
+        pvc://<pvc-name>/<path>. The authority names an existing PVC in the
+        target project, resolved under caller permissions. The non-empty path
+        is relative to the volume root, not a host filesystem path. Reject
+        parent-directory traversal, including percent-encoded forms, and
+        leading separators or backslashes. Domain validation must also ensure
+        the decoded, normalized path cannot escape the volume root. No PVC is
+        created automatically; no query string or fragment is accepted.
+      example: pvc://training-data/datasets/alpaca/train.jsonl
+
     ModelSpec:
       type: object
       additionalProperties: false
-      required:
-        - source
-        - uri
+      description: Model input selected by its project-scoped storage URI.
+      required: [uri]
       properties:
-        source:
-          type: string
-          enum: [huggingface, s3, pvc, oci]
-          example: huggingface
         uri:
-          type: string
-          example: meta-llama/Llama-3.2-3B
-        secret_ref:
-          type: string
-          description: >
-            Existing Secret in the target project, accessible under the caller's
-            permissions. Supply its name, not credential contents. The API must
-            not retrieve it using an elevated identity.
-          example: hf-secret-token
+          $ref: '#/components/schemas/TrainingInputURI'
+      example:
+        uri: hf://hf-secret-token/meta-llama/Llama-3.2-3B
 
     DatasetSpec:
       type: object
       additionalProperties: false
-      description: Dataset references, including PVCs and secrets, are scoped to the target project.
-      required:
-        - source
-        - uri
+      description: Dataset input selected by its project-scoped storage URI.
+      required: [uri]
       properties:
-        source:
-          type: string
-          enum: [huggingface, s3, pvc, http]
-          example: huggingface
         uri:
-          type: string
-          example: tatsu-lab/alpaca
-        split:
-          type: string
-          default: train
-        secret_ref:
-          type: string
-          description: Existing Secret name in the target project; caller permissions apply.
+          $ref: '#/components/schemas/TrainingInputURI'
+      example:
+        uri: hf://hf-secret-token/tatsu-lab/alpaca
 
     AlgorithmSpec:
       type: object
@@ -639,11 +975,18 @@ components:
           type: object
           additionalProperties: true
           description: >
-            Optional hyperparameter overrides. Opaque values validated against the selected
-            algorithm's Training Hub parameter schema.
+            Optional hyperparameter overrides validated against the selected
+            algorithm's Training Hub parameter schema. Basic lora_sft overrides
+            include learning_rate, num_epochs, effective_batch_size (total
+            samples per optimizer update across GPUs and gradient accumulation),
+            and max_seq_len (maximum tokens per training sample). These are
+            optional overrides; example values are not API defaults. Omitted
+            parameters use the configured backend's defaults.
           example:
             learning_rate: 0.00002
             num_epochs: 3
+            effective_batch_size: 8
+            max_seq_len: 2048
 
     ResourceSpec:
       type: object
@@ -681,15 +1024,19 @@ components:
       required: [destination_uri]
       description: >
         If output is omitted from the request, output is ephemeral. If present,
-        destination_uri is required; any credential reference must name an
-        authorized Secret in the target project.
+        destination_uri is required and uses
+        s3://<connection-name>/<bucket-name>/<path> or pvc://<pvc-name>/<path>.
+        The URI carries a project-local connection or PVC name, not credentials;
+        no separate secret_ref is accepted. Resolve under caller permissions,
+        without creating connections or PVCs. HF publishing is not supported.
       properties:
         destination_uri:
           type: string
-          example: s3://my-ml-bucket/checkpoints/llama3-lora/
-        secret_ref:
-          type: string
-          description: Existing Secret name in the target project; caller permissions apply.
+          oneOf:
+            - $ref: '#/components/schemas/S3StorageURI'
+            - $ref: '#/components/schemas/PVCStorageURI'
+      example:
+        destination_uri: s3://checkpoint-storage/my-ml-bucket/checkpoints/llama3-lora/
 
     TrainingJobSubmission:
       type: object
@@ -727,13 +1074,47 @@ components:
           type: string
           enum: [ray]
 
+    TrainingJobSummary:
+      type: object
+      additionalProperties: false
+      description: >
+        Compact list item for a caller-readable RayJob. The id is the RayJob
+        name; use the project-scoped detail endpoint for all other job details.
+        Optional fields are omitted when unavailable.
+      required:
+        - id
+        - status
+        - created_at
+      properties:
+        id:
+          type: string
+          description: Name of the RayJob custom resource in the requested project.
+          example: llama3-8b-alpaca-lora
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        queue_name:
+          type: string
+          nullable: true
+          description: Kueue LocalQueue recorded in training submission metadata, when available.
+          example: team-alpha-local-queue
+        created_at:
+          type: string
+          format: date-time
+          description: >
+            RayJob resource creation timestamp from Kubernetes
+            metadata.creationTimestamp, in RFC 3339 format. Present for all
+            persisted RayJobs, including externally created jobs; not the
+            training start time.
+
     TrainingJob:
       type: object
       description: >
         Current view assembled from a caller-authorized RayJob resource and
         available Ray status. Includes caller-readable RayJobs regardless of
         whether they were created by this API. Optional fields are omitted when
-        unavailable; the service does not persist job state.
+        unavailable; the service does not persist job state. API-created jobs
+        include their accepted POST payload in submission. External or older
+        jobs without recorded submission metadata omit that field.
       required:
         - id
         - project
@@ -750,6 +1131,33 @@ components:
         project:
           type: string
           example: team-alpha-ml
+        submitted_by:
+          type: string
+          readOnly: true
+          description: >
+            Original submitter's OpenShift username, resolved from the
+            authenticated submission token and recorded in the RayJob annotation
+            training.rhoai.io/submitted-by. May be a human username or a service
+            account identity such as system:serviceaccount:team-alpha-ml:training-client.
+            Never supplied by a client or inferred from the caller reading the
+            job. Omitted when the annotation is absent. Informational attribution
+            only, not tamper-proof audit evidence and never used for authorization.
+          example: alice
+        submission:
+          readOnly: true
+          description: >
+            Accepted POST payload retained for API-created jobs in
+            caller-authorized RayJob metadata. Preserves submitted values,
+            including model, dataset, algorithm parameters, and any supplied
+            queue, backend, resources, or output settings. Optional fields and
+            nested defaults that were not supplied remain absent; this is not
+            the effective runtime configuration. Omitted for external or older
+            jobs without recorded submission metadata; never reconstructed from
+            command-line arguments or raw runtime environments. Storage URIs
+            contain project-local Secret, connection, or PVC names only,
+            never credentials or Secret contents.
+          allOf:
+            - $ref: '#/components/schemas/CreateJobRequest'
         queue_name:
           type: string
           nullable: true
@@ -794,11 +1202,20 @@ components:
             learning_rate: 0.00015
             throughput_tokens_per_sec: 1420.5
         resources:
-          $ref: '#/components/schemas/ResourceSpec'
+          description: >
+            Runtime resource configuration from an authorized source, when
+            available. Do not infer it solely from requested resources;
+            submission.resources preserves the submitted settings separately.
+          allOf:
+            - $ref: '#/components/schemas/ResourceSpec'
         created_at:
           type: string
           format: date-time
-          description: Submission timestamp, when available in submission metadata.
+          description: >
+            RayJob resource creation timestamp from Kubernetes
+            metadata.creationTimestamp, in RFC 3339 format, including for
+            externally created jobs. Distinct from the training start time
+            reported in started_at.
         started_at:
           type: string
           format: date-time
@@ -806,7 +1223,11 @@ components:
         finished_at:
           type: string
           format: date-time
-          description: Ray end timestamp converted to RFC 3339; omitted until available.
+          description: >
+            Ray execution end timestamp in RFC 3339 format, when reported for
+            a terminal SUCCEEDED, FAILED, or STOPPED job. Omitted while pending
+            or running, or when Ray has not reported an end time. Never inferred
+            from the current time or resource creation time.
         failure_reason:
           type: string
           description: Ray failure message when status is FAILED, if available.
