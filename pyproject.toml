@@ -15,12 +15,14 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
+    "aiohttp>=3.10,<4",
     "fastapi>=0.115,<1",
     "jsonschema>=4.23,<5",
     "kubernetes>=31,<36",
     "pydantic>=2.10,<3",
     "pydantic-settings>=2.7,<3",
     "PyYAML>=6,<7",
+    "ray[default]==2.55.1",
     "uvicorn[standard]>=0.34,<1",
 ]
 
