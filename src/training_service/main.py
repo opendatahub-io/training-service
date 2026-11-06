@@ -1,18 +1,27 @@
 """FastAPI application entry point."""
 
+import logging
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 
+import anyio
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from training_service.api_impl import observability, training_jobs  # noqa: F401
+from training_service import catalog
+from training_service.api_impl import (  # noqa: F401
+    infrastructure_discovery,
+    observability,
+    training_jobs,
+)
 from training_service.auth import KubernetesTokenAuthenticator, OpenShiftTokenAuthenticator
 from training_service.authorization import KubernetesProjectAuthorizer, OpenShiftProjectAuthorizer
 from training_service.contract import component_validator, contract_document, load_contract
 from training_service.errors import ApiError
 from training_service.jobs import CodeFlareJobBackend, JobsBackend, JobSubmitter
+from training_service.logs import log_stream_timeout_seconds
 from training_service_api.apis.estimations_api import router as estimations_router
 from training_service_api.apis.infrastructure_discovery_api import router as discovery_router
 from training_service_api.apis.observability_api import router as observability_router
@@ -20,6 +29,7 @@ from training_service_api.apis.training_jobs_api import router as jobs_router
 from training_service_api.models.error_response import ErrorResponse
 
 _SUBMISSION_PATH = re.compile(r"^/api/v1/projects/[^/]+/training-jobs$")
+_LOG = logging.getLogger(__name__)
 _SAFE_FIELD = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
@@ -75,13 +85,25 @@ def create_app(
 ) -> FastAPI:
     """Create the HTTP application."""
     contract = load_contract()
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        try:
+            await anyio.to_thread.run_sync(catalog.load_catalog)
+        except ApiError as error:
+            # Keep diagnostics alive, but never report readiness with a bad catalog.
+            _LOG.error("%s", error.message)
+        yield
+
     application = FastAPI(
         title=contract["info"]["title"],
         version=contract["info"]["version"],
         description=contract["info"]["description"],
         swagger_ui_parameters={"persistAuthorization": False},
+        lifespan=lifespan,
     )
 
+    application.state.log_stream_timeout_seconds = log_stream_timeout_seconds()
     application.state.token_authenticator = authenticator or KubernetesTokenAuthenticator()
     application.state.project_authorizer = authorizer or KubernetesProjectAuthorizer()
     application.state.job_backend = backend or CodeFlareJobBackend()
@@ -148,6 +170,7 @@ def create_app(
 
     @application.get("/readyz", include_in_schema=False)
     def ready() -> dict[str, str]:
+        catalog.load_catalog()
         return {"status": "ok"}
 
     return application

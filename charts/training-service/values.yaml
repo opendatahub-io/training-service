@@ -1,9 +1,21 @@
 replicaCount: 1
 
 image:
-  repository: quay.io/opendatahub/training-service
+  # Intended public release repository; requires publication by a modh maintainer.
+  # Until published, override repository/tag with an available service image.
+  repository: quay.io/modh/training-service
   pullPolicy: IfNotPresent
-  tag: ""
+  tag: "0.1.0"
+
+# Ray workload image containing Training Hub, separate from the API service image.
+# An init container discovers its Training Hub algorithms automatically, without a GPU.
+# Public default includes Ray 2.58.0, CUDA 13.0 and Training Hub 0.11.2.
+# Override with a tested image digest for your cluster when needed.
+trainingRuntime:
+  image: quay.io/modh/ray:2.58.0-py312-cu130-th0112
+  # Alternatives: ensure the chosen Ray version matches your API/SDK deployment.
+  # image: quay.io/modh/ray:2.55.1-py312-cu129-th081
+  # image: quay.io/modh/ray:2.58.0-py312-cu129-th081
 
 imagePullSecrets: []
 nameOverride: ""
@@ -26,8 +38,8 @@ authentication:
   tokenReview:
     enabled: true
 
-# Runtime configuration is intentionally generic until the authentication,
-# authorization, and SDK work defines the service's stable environment names.
+# Additional settings, such as the Ray gateway URL and trusted CA path.
+# Use trainingRuntime.image instead of setting TRAINING_RAY_IMAGE here.
 env: []
 envFrom: []
 
@@ -58,7 +70,7 @@ service:
   port: 8080
 
 route:
-  enabled: false
+  enabled: true
   annotations: {}
   host: ""
   path: ""

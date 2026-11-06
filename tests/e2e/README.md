@@ -33,8 +33,9 @@ Prepare once:
   repo, add `--use-podman-auth` as described below: local Podman login alone does
   not authorize Kubernetes image pulls. The runner never copies a pre-existing
   cluster Secret or changes cluster-wide pull credentials.
-- Copy [values.example.yaml](examples/values.example.yaml) outside the repo and supply a
-  compatible Ray + Training Hub runtime and authenticated Ray gateway.
+- Copy [values.example.yaml](examples/values.example.yaml) outside the repo and supply
+  the authenticated Ray gateway. The chart's public Ray + Training Hub image is
+  used by default; set `trainingRuntime.image` only to override it.
   The runner automatically reads the cluster's **public ingress certificate
   bundle** from `openshift-config-managed/default-ingress-cert` (`ca-bundle.crt`).
   It saves it only under the ignored per-run results directory, uses it for
@@ -212,9 +213,13 @@ The [namespace manifest](fixtures/namespace.yaml) includes
 unique E2E ownership label. It creates LocalQueue `e2e` backed by the existing
 ClusterQueue `default` (override with `--cluster-queue`), a 5Gi RWX PVC and a
 fixture/verifier pod. The pod downloads a pinned public Qwen2.5-0.5B-Instruct
-revision and prepares eight chat examples plus twelve math examples; training
-uses PVC references and
-needs no HF token. The generated request and manifests are saved with results.
+revision and prepares eight chat examples plus twelve math examples; training uses PVC references and
+needs no HF token. Set `trainingRuntime.image` in the E2E values file to the
+tested Ray/Training Hub image; it is separate from the API service image the runner
+builds or reuses. The runner exports that runtime's Training Hub registry into
+a test-owned ConfigMap, configures algorithm discovery in Helm, and checks the
+compact list, details, schema opt-in, native parameter examples and error responses. The generated
+request and manifests (including the catalog) are saved with results.
 The fixture pod uses the new namespace's OpenShift-allocated `fsGroup` so the CSI
 driver can grant non-root access to its new PVC; no privileged/root setup pod or
 shared storage permission change is used. A write check runs before the download.
@@ -283,8 +288,10 @@ The normal deployment command above **always includes Kueue**. To separately
 test an already-deployed service without Kueue, use `make test-e2e`, not the
 deployment runner. Supply a known-good [workload JSON](examples/job.example.json), existing
 PVC/model/dataset/output references and a prepared
-[read-only verifier pod](examples/artifact-verifier.example.yaml). The baseline
-checks `lora_sft`; `--algorithm-matrix` opts into all four supported algorithms.
+[read-only verifier pod](examples/artifact-verifier.example.yaml). Use discovery to
+check the algorithms and parameters available in the configured runtime. The default
+sanity workload uses `lora_sft`; `--algorithm-matrix` opts into the four supported
+execution profiles. Python-only Training Hub modes are not supported.
 
 ```bash
 # Set TRAINING_SERVICE_URL and TRAINING_SERVICE_PROJECT; the token defaults to oc.

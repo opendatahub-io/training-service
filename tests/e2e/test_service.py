@@ -276,16 +276,8 @@ def test_rejected_submission_creates_no_job(api, missing_job_id, pytestconfig, v
     }
     changes = {
         "unknown_algorithm": {"name": "not-an-algorithm"},
-        # Credential-free reproduction of the reported rejection; field-level guidance
-        # remains an explicit product gap in coverage.md, not a claimed passing case.
-        "unsupported_parameter": {
-            "parameters": {
-                "max_tokens_per_gpu": 128,
-                "warmup_steps": 0,
-                "accelerate_full_state_at_epoch": False,
-                "checkpoint_at_epoch": True,
-            }
-        },
+        # Accepted parameters belong to the runtime catalog, not a hardcoded API list.
+        "unsupported_parameter": {"parameters": {"unsupported_e2e_parameter": 128}},
         "bool_learning_rate": {"parameters": {"learning_rate": True}},
         "string_epochs": {"parameters": {"num_epochs": "1"}},
         "negative_epochs": {"parameters": {"num_epochs": -1}},
@@ -328,8 +320,8 @@ def test_algorithm_parameters_rejected_before_submission(
     bad_values = {
         "sft": {"num_epochs": "one"},
         "osft": {"unfreeze_rank_ratio": "half"},
-        "lora_sft": {"logging_steps": 0},
-        "lora_grpo": {"group_size": 0},
+        "lora_sft": {"logging_steps": "one"},
+        "lora_grpo": {"group_size": "four"},
     }
     parameters = (
         {"not_a_training_hub_parameter": 1} if invalid == "unsupported" else bad_values[algorithm]
