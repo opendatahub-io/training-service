@@ -24,12 +24,19 @@ model artifacts remain available after job cleanup.
 - **Explore the API:** open `/docs` on your service, or read the upstream
   [OpenAPI contract](https://github.com/opendatahub-io/training-service/blob/main/docs/api/openapi.yaml).
 
-Supported submission profiles are `sft`, `osft`, `lora_sft`, and `lora_grpo`.
+Supported submission profiles are `sft`, `osft`, `lora_sft`, `lora_grpo`,
+and `embedding_sft`.
 Discovery and submission validation use the same catalog from the configured
 training image. Check [runtime compatibility](docs/training-runtime.md) before
 selecting an image; GRPO requires a compatible verl/TRL runtime. The queue
 discovery endpoint lists project LocalQueues after checking Kueue readiness and
 project eligibility. See [Kueue preflight](docs/kueue-preflight.md) for setup and errors.
+
+Embedding SFT requires a model and a dataset with `text` and `label` columns
+(or mapped column names). The Ray driver temporarily installs pinned
+sentence-transformers dependencies into a job-local environment if the runtime
+lacks them. This requires access to a package index until the runtime image
+includes the extra.
 
 ## Development
 

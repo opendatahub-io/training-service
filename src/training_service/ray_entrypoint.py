@@ -293,6 +293,27 @@ class LoRAGRPOBackend(TrainingBackend):
         return {**parameters, "n_gpus": gpus_per_node, "nnodes": num_workers}
 
 
+class EmbeddingSFTBackend(SingleNodeTrainingBackend):
+    name = "embedding_sft"
+    backend_name = "sentence-transformers"
+
+    def required_dataset_columns(self, parameters: dict[str, Any], columns: set[str]) -> set[str]:
+        return {parameters.get("text_column", "text"), parameters.get("label_column", "label")}
+
+    def validate_parameters(self, values: dict[str, Any]) -> dict[str, Any]:
+        if values.get("loss_type", "batch_all_triplet") not in {
+            "batch_all_triplet",
+            "batch_hard_triplet",
+            "mnrl",
+        }:
+            raise ValueError(
+                "embedding_sft loss_type must be batch_all_triplet, batch_hard_triplet, or mnrl."
+            )
+        if values.get("batch_sampler") not in {None, "group_by_label", "no_duplicates", "default"}:
+            raise ValueError("embedding_sft batch_sampler is not supported by Training Hub.")
+        return values
+
+
 def _validate_pretraining(values: dict[str, Any]) -> None:
     if values.get("is_pretraining") and "block_size" not in values:
         raise ValueError("block_size is required for pretraining.")
@@ -302,7 +323,13 @@ def _validate_pretraining(values: dict[str, Any]) -> None:
 
 _BACKENDS = {
     backend.name: backend
-    for backend in (SFTBackend(), OSFTBackend(), LoRASFTBackend(), LoRAGRPOBackend())
+    for backend in (
+        SFTBackend(),
+        OSFTBackend(),
+        LoRASFTBackend(),
+        LoRAGRPOBackend(),
+        EmbeddingSFTBackend(),
+    )
 }
 
 
@@ -373,6 +400,68 @@ def _ensure_s3_runtime(workdir: Path) -> None:
     invalidate_caches()
     if not _s3_modules_available():
         raise RuntimeError("S3 support is unavailable after dependency installation.")
+
+
+def _algorithm_modules_available(name: str) -> bool:
+    try:
+        if name == "embedding_sft":
+            from sentence_transformers import SentenceTransformer  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _ensure_algorithm_runtime(name: str, workdir: Path) -> None:
+    """Temporarily add missing Embedding SFT extras in the Ray driver, not the API pod."""
+    requirements = {
+        "embedding_sft": (
+            "sentence-transformers==5.7.0",
+            "scikit-learn==1.7.2",
+            "joblib==1.5.2",
+            "threadpoolctl==3.6.0",
+        ),
+    }
+    if name not in requirements or _algorithm_modules_available(name):
+        return
+    # TODO: Remove this job-local bootstrap when the RHOAI Ray runtime includes
+    # sentence-transformers. The API image cannot supply imports to RayJob pods.
+    packages = workdir / name / "site-packages"
+    try:
+        # Reuse the runtime's Transformers, Hub, and kernels. Resolving
+        # transitive dependencies replaces them incompatibly.
+        packages.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-cache-dir",
+                "--only-binary=:all:",
+                "--no-deps",
+                "--target",
+                str(packages),
+                *requirements[name],
+            ],
+            check=False,
+            capture_output=True,
+            timeout=600,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(
+            f"{name} dependencies are missing from the Ray runtime and their temporary "
+            "job-local installation failed. Check the package index and Ray pod network access."
+        ) from error
+    if result.returncode:
+        raise RuntimeError(
+            f"{name} dependencies are missing from the Ray runtime and their temporary "
+            "job-local installation failed. Check the package index and Ray pod network access."
+        )
+    sys.path.insert(0, str(packages))
+    invalidate_caches()
+    if not _algorithm_modules_available(name):
+        raise RuntimeError(f"{name} dependencies are unavailable after job-local installation.")
 
 
 def _s3_client(location: dict[str, Any]) -> Any:
@@ -520,6 +609,7 @@ def main(configuration: dict[str, Any]) -> None:
     ):
         _ensure_s3_runtime(workdir)
     algorithm = configuration["algorithm"]
+    _ensure_algorithm_runtime(algorithm, workdir)
     remote_hf = get_backend(algorithm).remote_hf
     model_path = _input(configuration["model"], "model", workdir, remote_hf=remote_hf)
     data_path = _input(configuration["dataset"], "dataset", workdir, remote_hf=remote_hf)
