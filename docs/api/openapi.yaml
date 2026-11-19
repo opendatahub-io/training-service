@@ -25,7 +25,7 @@ paths:
     get:
       summary: "List training algorithms"
       description: >-
-        List the algorithms registered in the configured training environment. Follow
+        List the algorithms registered in the configured Training Hub runtime. Follow
         details_url for parameter definitions and submission requirements.
       operationId: listAlgorithms
       x-request-context: true
