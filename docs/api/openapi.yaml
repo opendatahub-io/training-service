@@ -3,8 +3,8 @@ info:
   title: "Training API - RHOAI 3.6 Developer Preview"
   description: >-
     Submit and manage model fine-tuning jobs. Discover training algorithms, configure training
-    resources, monitor job status, and retrieve logs. RHOAI 3.6 Developer Preview supports the
-    Ray backend only.
+    resources, monitor job status, and retrieve logs. Backend availability depends on the RHOAI
+    release.
   version: "0.1.0"
 servers:
   - url: "/api/v1"
@@ -25,7 +25,7 @@ paths:
     get:
       summary: "List training algorithms"
       description: >-
-        List the algorithms registered in the configured training environment. Follow
+        List the algorithms registered in the configured Training Hub runtime. Follow
         details_url for parameter definitions and submission requirements.
       operationId: listAlgorithms
       x-request-context: true
@@ -223,20 +223,20 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
               example:
                 code: submission_unavailable
-                message: RayJob submission is unavailable.
+                message: Training job submission is unavailable.
         '403':
           $ref: '#/components/responses/403Forbidden'
         '404':
           $ref: '#/components/responses/404NotFound'
         '409':
-          description: RayJob already exists, Kueue is absent (kueue_not_installed), or project is excluded (kueue_project_excluded)
+          description: Training job already exists, Kueue is absent (kueue_not_installed), or project is excluded (kueue_project_excluded)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
               example:
                 code: already_exists
-                message: A RayJob with this name already exists in the project.
+                message: A training job with this name already exists in the project.
         '415':
           $ref: '#/components/responses/415UnsupportedMediaType'
         '422':
@@ -321,16 +321,16 @@ paths:
                         status: RUNNING
                         queue_name: team-alpha-local-queue
                         created_at: '2026-10-04T09:00:00Z'
-                      - id: external-ray-job
+                      - id: external-training-job
                         status: PENDING
                         created_at: '2026-10-04T09:05:00Z'
-                      - id: completed-ray-job
+                      - id: completed-training-job
                         status: SUCCEEDED
                         created_at: '2026-10-04T08:30:00Z'
-                      - id: failed-ray-job
+                      - id: failed-training-job
                         status: FAILED
                         created_at: '2026-10-04T08:00:00Z'
-                      - id: externally-stopped-ray-job
+                      - id: externally-stopped-training-job
                         status: STOPPED
                         created_at: '2026-10-04T07:30:00Z'
                     next_page_token: opaque-next-page-token
@@ -439,14 +439,14 @@ paths:
                 completed_job:
                   summary: Completed job
                   value:
-                    id: completed-ray-job
-                    name: completed-ray-job
+                    id: completed-training-job
+                    name: completed-training-job
                     project: team-alpha-ml
                     status: SUCCEEDED
                     selected_backend: ray
                     submitted_by: alice
                     submission:
-                      name: completed-ray-job
+                      name: completed-training-job
                       model:
                         uri: hf://hf-secret-token/Qwen/Qwen2.5-0.5B
                       dataset:
@@ -465,14 +465,14 @@ paths:
                 minimal_submission:
                   summary: Earlier submission without output storage
                   value:
-                    id: minimal-ray-job
-                    name: minimal-ray-job
+                    id: minimal-training-job
+                    name: minimal-training-job
                     project: team-alpha-ml
                     status: PENDING
                     selected_backend: ray
                     submitted_by: bob
                     submission:
-                      name: minimal-ray-job
+                      name: minimal-training-job
                       model:
                         uri: hf://hf-secret-token/Qwen/Qwen2.5-0.5B
                       dataset:
@@ -482,7 +482,7 @@ paths:
                 external_job:
                   summary: Job submitted outside this API
                   value:
-                    id: external-ray-job
+                    id: external-training-job
                     project: team-alpha-ml
                     status: PENDING
                     selected_backend: ray
@@ -542,11 +542,11 @@ paths:
                 shared_cluster:
                   value:
                     code: shared_cluster
-                    message: Shared RayClusters cannot be deleted by this API.
+                    message: Shared workload clusters cannot be deleted by this API.
                 unowned_cluster:
                   value:
                     code: unowned_cluster
-                    message: RayCluster is not exclusively owned by this RayJob.
+                    message: The workload cluster is not exclusively owned by this training job.
 
   /projects/{project}/training-jobs/{job_id}/logs:
     get:
@@ -626,14 +626,14 @@ paths:
                 code: logs_not_ready
                 message: Driver logs are not available yet; retry later.
         '410':
-          description: "The training cluster and its logs are no longer available."
+          description: "The backend execution resources and their logs are no longer available."
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
               example:
-                code: ray_cluster_gone
-                message: Logs are no longer available because the training cluster was removed.
+                code: execution_resources_gone
+                message: Logs are no longer available because the backend execution resources were removed.
 
   /projects/{project}/queues:
     get:
@@ -794,7 +794,7 @@ components:
       type: string
       enum: [ray, kft]
       default: ray
-      description: "Execution backend. RHOAI 3.6 Developer Preview supports ray only; kft requests return 501."
+      description: "Execution backend. Availability depends on the TaaS release; requests for an unimplemented backend return 501."
 
     JobStatus:
       type: string
@@ -1265,7 +1265,7 @@ components:
             - kueue_not_installed
             - kueue_project_excluded
             - logs_not_ready
-            - ray_cluster_gone
+            - execution_resources_gone
             - unsupported_media_type
             - validation_error
             - authentication_unavailable
