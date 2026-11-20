@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import sys
 from importlib import invalidate_caches
@@ -83,11 +84,31 @@ class TrainingBackend:
         import training_hub
 
         algorithm = training_hub.create_algorithm(self.name, self.backend_name)
+        options = self.training_options(
+            data_path, output_dir, parameters, gpus_per_node, num_workers
+        )
+        if os.getenv("TRAINING_SERVICE_MLFLOW_RUN"):
+            import inspect
+
+            from training_service_metrics_runtime import current_recorder
+
+            public = getattr(training_hub, self.name, algorithm.train)
+            supported = "callbacks" in inspect.signature(public).parameters
+            current_recorder().emit(
+                tags={
+                    "tracking.unified_callbacks": str(supported).lower(),
+                    "tracking.checkpoint_timing": "backend_reported_only",
+                }
+            )
+            if supported:
+                from training_service_metrics_callback import MLflowMetricsCallback
+
+                options["callbacks"] = [MLflowMetricsCallback()]
         return algorithm.train(
             model_path=self.model_path(model_path),
             data_path=data_path,
             ckpt_output_dir=str(output_dir),
-            **self.training_options(data_path, output_dir, parameters, gpus_per_node, num_workers),
+            **options,
         )
 
 
@@ -510,7 +531,7 @@ def _run_training(
     )
 
 
-def main(configuration: dict[str, Any]) -> None:
+def _execute(configuration: dict[str, Any]) -> None:
     """Resolve input locators, execute the selected algorithm, and save output."""
 
     workdir = Path("/tmp/training-api")
@@ -530,7 +551,7 @@ def main(configuration: dict[str, Any]) -> None:
         else workdir / "output"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-    _run_training(
+    result = _run_training(
         algorithm,
         model_path,
         data_path,
@@ -539,5 +560,70 @@ def main(configuration: dict[str, Any]) -> None:
         configuration["gpus_per_node"],
         configuration["num_workers"],
     )
+    if configuration.get("mlflow"):
+        from training_service_metrics_runtime import current_recorder
+
+        recorder = current_recorder()
+        if isinstance(result, dict):
+            recorder.emit({"result": result})
+        recorder.emit(directory_size=("artifacts/output_directory_bytes", str(output_dir)))
     if output is not None and output["scheme"] == "s3":
         _upload_s3(output, output_dir)
+
+
+def main(configuration: dict[str, Any]) -> None:
+    """Own run lifetime around input loading, every algorithm, and output upload."""
+    tracked = configuration.get("mlflow")
+    if not tracked:
+        _execute(configuration)
+        return
+    import signal
+    import socket
+    import time
+    from datetime import UTC, datetime
+
+    from training_service_metrics_runtime import current_recorder
+
+    os.environ["TRAINING_SERVICE_MLFLOW_RUN"] = json.dumps(tracked)
+    os.environ["TRAINING_SERVICE_MLFLOW_DRIVER_PROCESS"] = f"{socket.gethostname()}:{os.getpid()}"
+    recorder = current_recorder()
+    started = time.monotonic()
+    recorder.emit(
+        {"job/started_at_unix_seconds": time.time()},
+        tags={
+            "job.started_at": datetime.now(UTC).isoformat(),
+            "tracking.resource_scope": "instrumented_pods_and_rank_processes",
+            "training.phase": "initializing",
+        },
+    )
+    recorder.start_sampling()
+
+    def cancelled(signum: int, frame: Any) -> None:
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, cancelled)
+    status = "FAILED"
+    try:
+        _execute(configuration)
+        status = "FINISHED"
+    except (SystemExit, KeyboardInterrupt):
+        status = "KILLED"
+        raise
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            recorder.emit(
+                {
+                    "job/duration_seconds": time.monotonic() - started,
+                    "job/finished_at_unix_seconds": time.time(),
+                },
+                tags={
+                    "job.finished_at": datetime.now(UTC).isoformat(),
+                    "training.phase": {"FINISHED": "completed", "KILLED": "cancelled"}.get(
+                        status, "failed"
+                    ),
+                },
+            )
+            recorder.close(status)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
