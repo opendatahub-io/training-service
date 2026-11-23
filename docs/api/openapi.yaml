@@ -98,10 +98,10 @@ paths:
     post:
       summary: "Submit a training job"
       description: >-
-        Validate and submit a training job in the specified project through the
-        CodeFlare/Ray SDK. Reference existing model, dataset, and output storage
-        in that project. An S3 or PVC output destination is required to retain
-        trained model artifacts. Use the returned ID to check status or retrieve logs.
+        Validate and submit a training job in the specified project. Reference
+        existing model, dataset, and output storage in that project. An S3 or
+        PVC output destination is required to retain trained model artifacts.
+        Use the returned ID to check status or retrieve logs.
       operationId: createTrainingJob
       x-submission-context: true
       x-project-authorization:

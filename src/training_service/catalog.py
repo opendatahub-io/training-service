@@ -148,7 +148,14 @@ def validate_parameters(
     if name in GATED_ALGORITHMS:
         raise invalid(f"Algorithm '{name}' is not enabled for submission through this API.")
     if algorithm is None:
-        available = ", ".join(item["name"] for item in payload["algorithms"]) or "none"
+        available = (
+            ", ".join(
+                item["name"]
+                for item in payload["algorithms"]
+                if item["name"] not in GATED_ALGORITHMS
+            )
+            or "none"
+        )
         raise invalid(
             f"Algorithm '{name}' is not available in the configured training runtime. "
             f"Available algorithms: {available}."

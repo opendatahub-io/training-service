@@ -80,6 +80,19 @@ def test_compact_catalog_matches_configured_runtime(api):
         (Path(directory) / "algorithm-discovery.json").write_text(json.dumps(data, indent=2))
 
 
+def test_embedding_sft_is_exported_by_selected_runtime(api, pytestconfig):
+    if not (
+        pytestconfig.getoption("embedding_sft_only") or pytestconfig.getoption("algorithm_matrix")
+    ):
+        pytest.skip("Select the embedding_sft E2E profile to verify its runtime catalog")
+    algorithms = api.object(api.request("GET", BASE))["algorithms"]
+    assert "embedding_sft" in {item["name"] for item in algorithms}, (
+        "The deployed training runtime did not export embedding_sft"
+    )
+    detail = api.object(api.request("GET", BASE + "/embedding_sft"))
+    assert {"loss_type", "batch_size", "batch_sampler"} <= set(detail["parameters"])
+
+
 def test_follow_algorithm_details_and_opt_into_schema(api):
     summaries = api.object(api.request("GET", BASE))["algorithms"]
     for summary in summaries:

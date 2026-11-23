@@ -301,7 +301,8 @@ class EmbeddingSFTBackend(SingleNodeTrainingBackend):
         return {parameters.get("text_column", "text"), parameters.get("label_column", "label")}
 
     def validate_parameters(self, values: dict[str, Any]) -> dict[str, Any]:
-        if values.get("loss_type", "batch_all_triplet") not in {
+        loss_type = values.get("loss_type", "batch_all_triplet")
+        if loss_type not in {
             "batch_all_triplet",
             "batch_hard_triplet",
             "mnrl",
@@ -309,8 +310,30 @@ class EmbeddingSFTBackend(SingleNodeTrainingBackend):
             raise ValueError(
                 "embedding_sft loss_type must be batch_all_triplet, batch_hard_triplet, or mnrl."
             )
-        if values.get("batch_sampler") not in {None, "group_by_label", "no_duplicates", "default"}:
+        sampler = values.get("batch_sampler")
+        if sampler not in {None, "group_by_label", "no_duplicates", "default"}:
             raise ValueError("embedding_sft batch_sampler is not supported by Training Hub.")
+        if loss_type == "mnrl" and sampler == "group_by_label":
+            raise ValueError(
+                "embedding_sft batch_sampler='group_by_label' cannot be used with "
+                "loss_type='mnrl': Training Hub converts the dataset to anchor/positive "
+                "pairs without labels. Use batch_sampler='no_duplicates' or omit it."
+            )
+        effective_sampler = sampler or (
+            "no_duplicates" if loss_type == "mnrl" else "group_by_label"
+        )
+        if effective_sampler == "group_by_label":
+            batch_size = values.get("batch_size", 32)
+            if (
+                isinstance(batch_size, bool)
+                or not isinstance(batch_size, int)
+                or batch_size < 4
+                or batch_size % 2
+            ):
+                raise ValueError(
+                    "embedding_sft batch_size must be an even integer >= 4 when "
+                    "batch_sampler='group_by_label' (the default for triplet losses)."
+                )
         return values
 
 

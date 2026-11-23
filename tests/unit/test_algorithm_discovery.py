@@ -140,6 +140,9 @@ def test_gepa_is_not_advertised_or_submittable(client, catalog_file, image_catal
     with pytest.raises(ApiError, match="not enabled") as raised:
         catalog.validate_parameters("gepa", {}, "ray")
     assert raised.value.status_code == 422
+    with pytest.raises(ApiError, match="Available algorithms") as raised:
+        catalog.validate_parameters("unknown", {}, "ray")
+    assert "gepa" not in raised.value.message
 
 
 def test_detail_lists_every_parameter_without_fabricating_defaults(client: TestClient) -> None:

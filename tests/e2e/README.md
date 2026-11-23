@@ -67,7 +67,11 @@ To validate **only Embedding SFT** without waiting for the other algorithms
 `--algorithm-matrix` with `--embedding-sft-only` in the command above. This
 still runs the HTTP checks and active LoRA cancellation checks. The runner
 requires the Embedding SFT job to succeed and verifies its logs, output and cleanup;
-it does not count a skipped job as a pass.
+it does not count a skipped job as a pass. It also checks that the deployed
+runtime catalog advertises `embedding_sft` and its loss, batch-size and sampler
+parameters. Require a passing embedding-only run when changing the training
+runtime image or algorithm catalog exporter; the default sanity run does not
+exercise this profile.
 Both modes also submit two isolated LoRA jobs and delete them while `PENDING`
 and `RUNNING`, verifying RayCluster/pod cleanup and a final `404`. The deploy
 runner always enables `--check-active-delete` and requires evidence for both

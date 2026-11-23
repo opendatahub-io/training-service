@@ -1100,6 +1100,7 @@ def _catalog_with_embedding_sft(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
                     "type": "object",
                     "properties": {
                         "loss_type": {"type": "string"},
+                        "batch_size": {"type": "integer"},
                         "text_column": {"type": "string"},
                         "label_column": {"type": "string"},
                         "batch_sampler": {"type": "string"},
@@ -1130,6 +1131,56 @@ def test_embedding_sft_requires_model_and_its_dataset_columns(
     payload.pop("model")
     with pytest.raises(ValueError, match="CreateJobRequest contract"):
         CreateJobRequest.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "parameters,reason",
+    [
+        (
+            {"loss_type": "mnrl", "batch_sampler": "group_by_label"},
+            "anchor/positive pairs without labels",
+        ),
+        ({"loss_type": "batch_all_triplet", "batch_size": 2}, "even integer >= 4"),
+        ({"loss_type": "batch_hard_triplet", "batch_size": 3}, "even integer >= 4"),
+        (
+            {"loss_type": "batch_all_triplet", "batch_sampler": "group_by_label", "batch_size": 5},
+            "even integer >= 4",
+        ),
+    ],
+)
+def test_embedding_sft_invalid_sampler_combinations_fail_before_submission(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, parameters: dict[str, Any], reason: str
+) -> None:
+    _catalog_with_embedding_sft(monkeypatch, tmp_path)
+    core = _mock_sdk(monkeypatch)
+    body = _sample()
+    body.algorithm.name = "embedding_sft"
+    body.algorithm.parameters = parameters
+    with pytest.raises(ApiError, match=reason) as raised:
+        submission.CodeFlareJobBackend("quay.io/example/ray:2.58.0")._submit_sync(
+            "team-alpha", body, CallerIdentity("alice", None, ()), "caller-token"
+        )
+    assert raised.value.status_code == 422
+    assert core.pvc_reads == []
+    assert FakeRayJob.instances == []
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"loss_type": "batch_all_triplet", "batch_size": 4},
+        {"loss_type": "batch_hard_triplet", "batch_size": 6},
+        {"loss_type": "mnrl", "batch_sampler": "no_duplicates", "batch_size": 2},
+    ],
+)
+def test_embedding_sft_valid_sampler_combinations_pass_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, parameters: dict[str, Any]
+) -> None:
+    _catalog_with_embedding_sft(monkeypatch, tmp_path)
+    body = _sample()
+    body.algorithm.name = "embedding_sft"
+    body.algorithm.parameters = parameters
+    submission._validate_request(body)
 
 
 def test_embedding_sft_dispatches_to_training_hub_class(
@@ -1186,17 +1237,31 @@ def test_embedding_sft_installer_is_job_local_and_pinned(
     assert any(package.startswith("sentence-transformers==") for package in commands[-1])
 
 
+@pytest.mark.parametrize("failure", ["exit", "oserror", "timeout", "missing_import"])
 def test_new_algorithm_missing_packages_fail_before_training(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
 ) -> None:
     monkeypatch.setattr(ray_entrypoint, "_algorithm_modules_available", lambda _name: False)
-    monkeypatch.setattr(
-        ray_entrypoint.subprocess,
-        "run",
-        lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
-    )
-    with pytest.raises(RuntimeError, match="job-local installation failed"):
-        ray_entrypoint._ensure_algorithm_runtime("embedding_sft", tmp_path)
+
+    def install(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        if failure == "oserror":
+            raise OSError("pip unavailable")
+        if failure == "timeout":
+            raise ray_entrypoint.subprocess.TimeoutExpired("pip", 600)
+        return SimpleNamespace(returncode=0 if failure == "missing_import" else 1)
+
+    monkeypatch.setattr(ray_entrypoint.subprocess, "run", install)
+    previous_path = list(sys.path)
+    try:
+        reason = (
+            "unavailable after job-local installation"
+            if failure == "missing_import"
+            else "job-local installation failed"
+        )
+        with pytest.raises(RuntimeError, match=reason):
+            ray_entrypoint._ensure_algorithm_runtime("embedding_sft", tmp_path)
+    finally:
+        sys.path[:] = previous_path
 
 
 @pytest.mark.parametrize("algorithm", ["sft", "osft", "lora_sft"])
