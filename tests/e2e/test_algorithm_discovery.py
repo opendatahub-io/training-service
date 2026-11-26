@@ -9,13 +9,13 @@ import pytest
 from jsonschema import Draft202012Validator
 from referencing import Registry
 
-from tests.e2e.algorithms import ALGORITHMS, PARAMETERS
+from tests.e2e.algorithms import BASE_ALGORITHMS, PARAMETERS
 from training_service.contract import component_validator
 
 BASE = "/api/v1/algorithms"
 
 
-@pytest.fixture(params=ALGORITHMS)
+@pytest.fixture(params=BASE_ALGORITHMS)
 def runtime_algorithm(api, request):
     name = request.param
     detail = api.object(
@@ -87,6 +87,19 @@ def test_compact_catalog_matches_configured_runtime(api):
         assert data["runtime"]["image"] == image
     if directory := os.getenv("TRAINING_SERVICE_EVIDENCE_DIR"):
         (Path(directory) / "algorithm-discovery.json").write_text(json.dumps(data, indent=2))
+
+
+def test_embedding_sft_is_exported_by_selected_runtime(api, pytestconfig):
+    if not (
+        pytestconfig.getoption("embedding_sft_only") or pytestconfig.getoption("algorithm_matrix")
+    ):
+        pytest.skip("Select the embedding_sft E2E profile to verify its runtime catalog")
+    algorithms = api.object(api.request("GET", BASE))["algorithms"]
+    assert "embedding_sft" in {item["name"] for item in algorithms}, (
+        "The deployed training runtime did not export embedding_sft"
+    )
+    detail = api.object(api.request("GET", BASE + "/embedding_sft"))
+    assert {"loss_type", "batch_size", "batch_sampler"} <= set(detail["parameters"])
 
 
 def test_follow_algorithm_details_and_opt_into_schema(api):

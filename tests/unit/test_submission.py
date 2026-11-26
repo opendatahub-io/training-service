@@ -1091,7 +1091,8 @@ def test_all_post_contract_examples_match_algorithm_validation() -> None:
 
 def test_runtime_catalog_covers_registered_execution_profiles() -> None:
     names = {item["name"] for item in catalog.load_catalog()["algorithms"]}
-    assert set(ray_entrypoint._BACKENDS) <= names
+    # The retained 0.8.1 snapshot predates these Training Hub 0.11.2 algorithms.
+    assert set(ray_entrypoint._BACKENDS) - {"embedding_sft"} <= names
     algorithm_spec = load_contract()["components"]["schemas"]["AlgorithmSpec"]
     assert "x-parameter-schemas" not in algorithm_spec
     assert "properties" not in algorithm_spec["properties"]["parameters"]
@@ -1099,6 +1100,181 @@ def test_runtime_catalog_covers_registered_execution_profiles() -> None:
         assert get_backend(name).name == name
     with pytest.raises(ValueError, match="Unsupported Training Hub algorithm"):
         get_backend("unreviewed_algorithm")
+
+
+def _catalog_with_embedding_sft(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    payload = json.loads(json.dumps(catalog.load_catalog()))
+    payload["algorithms"].extend(
+        [
+            {
+                "name": "embedding_sft",
+                "supported_backends": ["ray"],
+                "parameter_schema": {
+                    "type": "object",
+                    "properties": {
+                        "loss_type": {"type": "string"},
+                        "batch_size": {"type": "integer"},
+                        "text_column": {"type": "string"},
+                        "label_column": {"type": "string"},
+                        "batch_sampler": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        ]
+    )
+    path = tmp_path / "embedding-sft-catalog.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("TRAINING_SERVICE_CATALOG_PATH", str(path))
+    catalog._load_catalog.cache_clear()
+
+
+def test_embedding_sft_requires_model_and_its_dataset_columns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _catalog_with_embedding_sft(monkeypatch, tmp_path)
+    body = _sample()
+    body.algorithm.name = "embedding_sft"
+    body.algorithm.parameters = {"text_column": "sentence", "label_column": "category"}
+    submission._validate_request(body)
+    validate_dataset_columns("embedding_sft", body.algorithm.parameters, {"sentence", "category"})
+    with pytest.raises(ApiError, match="category"):
+        validate_dataset_columns("embedding_sft", body.algorithm.parameters, {"sentence"})
+    payload = body.model_dump(mode="json", exclude_unset=True)
+    payload.pop("model")
+    with pytest.raises(ValueError, match="CreateJobRequest contract"):
+        CreateJobRequest.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "parameters,reason",
+    [
+        (
+            {"loss_type": "mnrl", "batch_sampler": "group_by_label"},
+            "anchor/positive pairs without labels",
+        ),
+        ({"loss_type": "batch_all_triplet", "batch_size": 2}, "even integer >= 4"),
+        ({"loss_type": "batch_hard_triplet", "batch_size": 3}, "even integer >= 4"),
+        (
+            {"loss_type": "batch_all_triplet", "batch_sampler": "group_by_label", "batch_size": 5},
+            "even integer >= 4",
+        ),
+    ],
+)
+def test_embedding_sft_invalid_sampler_combinations_fail_before_submission(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, parameters: dict[str, Any], reason: str
+) -> None:
+    _catalog_with_embedding_sft(monkeypatch, tmp_path)
+    core = _mock_sdk(monkeypatch)
+    body = _sample()
+    body.algorithm.name = "embedding_sft"
+    body.algorithm.parameters = parameters
+    with pytest.raises(ApiError, match=reason) as raised:
+        submission.CodeFlareJobBackend("quay.io/example/ray:2.58.0")._submit_sync(
+            "team-alpha", body, CallerIdentity("alice", None, ()), "caller-token"
+        )
+    assert raised.value.status_code == 422
+    assert core.pvc_reads == []
+    assert FakeRayJob.instances == []
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"loss_type": "batch_all_triplet", "batch_size": 4},
+        {"loss_type": "batch_hard_triplet", "batch_size": 6},
+        {"loss_type": "mnrl", "batch_sampler": "no_duplicates", "batch_size": 2},
+    ],
+)
+def test_embedding_sft_valid_sampler_combinations_pass_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, parameters: dict[str, Any]
+) -> None:
+    _catalog_with_embedding_sft(monkeypatch, tmp_path)
+    body = _sample()
+    body.algorithm.name = "embedding_sft"
+    body.algorithm.parameters = parameters
+    submission._validate_request(body)
+
+
+def test_embedding_sft_dispatches_to_training_hub_class(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    recorded: dict[str, Any] = {}
+
+    def factory(name: str, backend: str) -> Any:
+        assert (name, backend) == ("embedding_sft", "sentence-transformers")
+        return SimpleNamespace(train=lambda **kwargs: recorded.update(kwargs))
+
+    monkeypatch.setitem(sys.modules, "training_hub", SimpleNamespace(create_algorithm=factory))
+    ray_entrypoint._run_training(
+        "embedding_sft",
+        "/model",
+        "/data.jsonl",
+        tmp_path,
+        {"num_epochs": 1},
+        1,
+        0,
+    )
+    assert recorded["data_path"] == "/data.jsonl"
+    assert recorded["model_path"] == "/model"
+    assert recorded["ckpt_output_dir"] == str(tmp_path)
+
+
+def test_embedding_sft_installer_is_job_local_and_pinned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    algorithm = "embedding_sft"
+    checks = iter((False, True))
+    monkeypatch.setattr(ray_entrypoint, "_algorithm_modules_available", lambda _name: next(checks))
+    commands: list[list[str]] = []
+
+    def install(command: list[str], **kwargs: Any) -> SimpleNamespace:
+        commands.append(command)
+        assert kwargs["timeout"] == 600
+        assert kwargs["capture_output"] is True
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(ray_entrypoint.subprocess, "run", install)
+    previous_path = list(sys.path)
+    try:
+        ray_entrypoint._ensure_algorithm_runtime(algorithm, tmp_path)
+        assert sys.path[0] == str(tmp_path / algorithm / "site-packages")
+    finally:
+        sys.path[:] = previous_path
+    assert len(commands) == 1
+    assert "--no-deps" in commands[0]
+    assert "--target" in commands[0]
+    assert "transformers<5" not in commands[0]
+    assert "scikit-learn==1.7.2" in commands[0]
+    assert "--only-binary=:all:" in commands[-1]
+    assert any(package.startswith("sentence-transformers==") for package in commands[-1])
+
+
+@pytest.mark.parametrize("failure", ["exit", "oserror", "timeout", "missing_import"])
+def test_new_algorithm_missing_packages_fail_before_training(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+) -> None:
+    monkeypatch.setattr(ray_entrypoint, "_algorithm_modules_available", lambda _name: False)
+
+    def install(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        if failure == "oserror":
+            raise OSError("pip unavailable")
+        if failure == "timeout":
+            raise ray_entrypoint.subprocess.TimeoutExpired("pip", 600)
+        return SimpleNamespace(returncode=0 if failure == "missing_import" else 1)
+
+    monkeypatch.setattr(ray_entrypoint.subprocess, "run", install)
+    previous_path = list(sys.path)
+    try:
+        reason = (
+            "unavailable after job-local installation"
+            if failure == "missing_import"
+            else "job-local installation failed"
+        )
+        with pytest.raises(RuntimeError, match=reason):
+            ray_entrypoint._ensure_algorithm_runtime("embedding_sft", tmp_path)
+    finally:
+        sys.path[:] = previous_path
 
 
 @pytest.mark.parametrize("algorithm", ["sft", "osft", "lora_sft"])
